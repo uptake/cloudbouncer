@@ -1,0 +1,13 @@
+{
+	"Variables": { 
+		"SLACK_WEBHOOK": "string",
+		"SLACK_CHANNEL": "string",
+		"DEFAULT_ENCRYPTION_KMS": "string",
+		"S3_INVENTORY_ACCOUNT": "string",
+		"S3_INVENTORY_BUCKET_PREFIX": "string",
+		"S3_INVENTORY_RULE_NAME": "string",
+		"S3_INVENTORY_FREQUENCY": "string",
+		"S3_INVENTORY_FORMAT": "string",
+		"S3_INVENTORY_VERSIONING": "string"
+    }
+}
