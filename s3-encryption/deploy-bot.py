@@ -131,6 +131,8 @@ if args['set-env-var'] == True:
 	lamba_env_var_file.write(json.dumps(lambda_env_var,indent=4,separators=(',', ': ')))
 	lamba_env_var_file.close()
 
+	ABORT = True
+	
 if args['deploy'] == True:
 	ABORT = False
 

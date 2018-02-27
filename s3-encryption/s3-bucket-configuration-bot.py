@@ -41,12 +41,12 @@ target_inventory_policy = {
     'InventoryConfiguration': {
         'Destination': {
             'S3BucketDestination': {
-                'AccountId': os.environ['S3_INVENTORY_ACCOUNT']
-                'Prefix': account
+                'AccountId': os.environ['S3_INVENTORY_ACCOUNT'],
+                'Prefix': account,
                 'Format': os.environ['S3_INVENTORY_FORMAT'],
                 'Encryption': {
-                    'SSES3': {}
-                }
+                    'SSES3': {},
+                },
             }
         },
         'IsEnabled': True,
@@ -127,7 +127,7 @@ def check_for_s3_inventory(bucketname, target_policy):
                     return True
         return False
 
-def apply_s3_inventory(target_policy):
+def apply_s3_inventory(bucketname, target_policy):
     global message
     try:
         response = s3.put_bucket_inventory_configuration(**target_policy)
@@ -217,15 +217,15 @@ def handler(event, context):
                     else:
                         location = 'us-east-1'
 
-                    target_policy['Bucket'] = bucketname
-                    target_policy['InventoryConfiguration']['Destination']['S3BucketDestination']['Bucket'] = 'arn:aws:s3:::' + os.environ['S3_INVENTORY_BUCKET_PREFIX'] + '-' + location
+                    target_inventory_policy['Bucket'] = bucketname
+                    target_inventory_policy['InventoryConfiguration']['Destination']['S3BucketDestination']['Bucket'] = 'arn:aws:s3:::' + os.environ['S3_INVENTORY_BUCKET_PREFIX'] + '-' + location
 
                     ### Enforce by Default ###
                     if check_default_encryption(bucketname) == False:
                         apply_default_encryption(bucketname)
 
-                    if check_for_s3_inventory(target_policy) == False:
-                        apply_s3_inventory(target_policy)
+                    if check_for_s3_inventory(bucketname, target_inventory_policy) == False:
+                        apply_s3_inventory(bucketname, target_inventory_policy)
 
                     ### Check and Alert ###
                     # Check public permissions via ACLs
@@ -265,8 +265,8 @@ def handler(event, context):
 
                 elif eventName == 'DeleteInventoryConfiguration':
                     message += 'Warning: `' + requestor + '` has deleted the S3 inventory configuration on bucket `' + bucketname +'` in account `' + account + '`, reviewing for compliance:\n'
-                    if check_for_s3_inventory(bucketname) == False:
-                        apply_s3_inventory(bucketname, location)
+                    if check_for_s3_inventory(bucketname, target_inventory_policy) == False:
+                        apply_s3_inventory(bucketname, target_inventory_policy)
 
                 elif eventName == 'DeleteBucket':
                     message += 'Warning: `' + requestor + '` has deleted the S3 bucket `' + bucketname +'` in account `' + account + '`.\n'
