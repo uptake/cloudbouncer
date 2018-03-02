@@ -132,7 +132,7 @@ if args['set-env-var'] == True:
 	lamba_env_var_file.close()
 
 	ABORT = True
-	
+
 if args['deploy'] == True:
 	ABORT = False
 
@@ -212,6 +212,18 @@ def create_iam_role():
 				print(e)
 		else:
 			print('Role ' + name + ' has been created in account ' + account + ', ARN: ' + response['Role']['Arn'])
+
+			# Customer IAM Waiter since one doesn't exist for Roles
+			role_exists = False
+			while(False):
+				try:
+					role_details = iam.get_role(RoleName=name)
+				except Exception as e:
+					pass
+				else:
+					if role_details['Role']:
+						role_exists = True
+				time.sleep(1)
 
 		# Add the actual policy to the the role
 		try:
