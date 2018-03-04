@@ -37,7 +37,7 @@ Examples:
 from docopt import docopt
 args = docopt(__doc__)
 
-if args['-h']==True or args['--help']==True:
+if args['-h'] is True or args['--help'] is True:
     print(__doc__)
 
 import boto3
@@ -47,6 +47,7 @@ import datetime
 import time
 import subprocess
 import os
+
 
 def load_file(filename, purpose):
 	try:
@@ -63,6 +64,7 @@ def load_file(filename, purpose):
 		else:
 			file.close()
 			return value
+
 
 def validate_file(filename):
 	try:
@@ -87,7 +89,7 @@ possible_environment_variables = [
 	"S3_INVENTORY_VERSIONING", #Required, "Current" | "All"
 ]
 
-if args['set-env-var'] == True:
+if args['set-env-var'] is True:
 	lambda_env_var = load_file('lambda-env-variables.txt', 'Lambda Environment Variables')
 
 	print('Lambda environment variables were: ')
@@ -133,7 +135,7 @@ if args['set-env-var'] == True:
 
 	ABORT = True
 
-if args['deploy'] == True:
+if args['deploy'] is True:
 	ABORT = False
 
 	if args['--accounts']:
@@ -148,7 +150,7 @@ if args['deploy'] == True:
 	# Shared variables
 	name = args['<botname>']   # 's3_bucket_configuration_audit_bot'
 
-	if args['--multiregion']==True:
+	if args['--multiregion'] is True:
 		multiregion = True
 	else:
 		multiregion = False
@@ -201,6 +203,7 @@ if args['deploy'] == True:
 		if lambda_environment_variables['Variables'][key] == 'string':
 			lambda_environment_variables['Variables'].pop(key, None)
 
+
 def create_iam_role():
 	if role_policy:
 		try:
@@ -233,6 +236,7 @@ def create_iam_role():
 		else:
 			print('Updated policy for IAM role in account ' + account)
 
+
 def create_lambda_function():
 	try:
 		response = aws_lambda.create_function(
@@ -254,6 +258,7 @@ def create_lambda_function():
 			print(e)
 	else:
 		print('Created lambda function in region ' + region + ' in account ' + account + ', ARN: ' + response['FunctionArn'])
+
 
 def update_lambda_function():
 	# Try to update code:
@@ -297,6 +302,7 @@ def update_lambda_function():
 	else:
 		print('Updated lambda function permissions for in region ' + region + ' in account ' + account + ' to allow CloudWatch triggers')
 
+
 def create_cloudwatch_targets():
 	try:
 		targets = cw.put_targets(
@@ -313,6 +319,7 @@ def create_cloudwatch_targets():
 	else:
 		print('Updated target lambda for cloudwatch rule ' + name + ' in region ' + region + ' in account ' + account)
 
+
 def create_cloudwatch_rule():
 	try:
 		new_rule = cw.put_rule(
@@ -328,7 +335,8 @@ def create_cloudwatch_rule():
 		print('Updated cloudwatch rule in region ' + region + ' in account ' + account + ', rule ARN = ' + new_rule['RuleArn'])
 		create_cloudwatch_targets()
 
-if ABORT == False: # If everything looks good, try to deploy #
+
+if ABORT is False: # If everything looks good, try to deploy #
 	for account in accounts:
 		session = boto3.session.Session(profile_name=account) #set profile per account
 		iam = session.client('iam')
@@ -340,7 +348,7 @@ if ABORT == False: # If everything looks good, try to deploy #
 		if 'S3_INVENTORY_ACCOUNT' not in lambda_environment_variables['Variables']:
 			lambda_environment_variables['Variables']['S3_INVENTORY_ACCOUNT'] = account_num
 
-		if multiregion == True:
+		if multiregion is True:
 			regions = boto3.session.Session(profile_name=account).client('ec2').describe_regions()
 		else:
 			regions = {'Regions':[{'RegionName':region}]}
@@ -359,4 +367,3 @@ if ABORT == False: # If everything looks good, try to deploy #
 			# Create CloudWatch Rules
 			cw = session.client('events')		
 			create_cloudwatch_rule()
-

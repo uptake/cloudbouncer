@@ -8,13 +8,13 @@ accountnum = boto3.client('sts').get_caller_identity()['Account']
 account = boto3.client('iam').list_account_aliases()['AccountAliases'][0]
 
 if 'SLACK_WEBHOOK' in os.environ:
-    SLACK=True
-    slack_url = os.environ['SLACK_WEBHOOK']               
-    slack_channel = os.environ['SLACK_CHANNEL']           
+    SLACK = True
+    slack_url = os.environ['SLACK_WEBHOOK']
+    slack_channel = os.environ['SLACK_CHANNEL']
 else:
-    SLACK=False
+    SLACK = False
 
-if 'DEFAULT_ENCRYPTION_KMS' in os.environ: 
+if 'DEFAULT_ENCRYPTION_KMS' in os.environ:
     target_encryption = {
         'Rules': [
             {
@@ -71,6 +71,7 @@ monitored_events = [
 message = ''
 message_attachment = {}
 
+
 def check_default_encryption(bucketname):
     global message
     try:
@@ -94,7 +95,8 @@ def check_default_encryption(bucketname):
                 message += ', but it does not match the target encryption policy this bot enforces of ' + json.dumps(target_encryption['Rules'][0]['ApplyServerSideEncryptionByDefault']) + ', please investigate.'
                 return True
         else:
-            return False      
+            return False
+
 
 def apply_default_encryption(bucketname):
     global message
@@ -113,6 +115,7 @@ def apply_default_encryption(bucketname):
     else:
         message += 'Default encryption policy ' + json.dumps(target_encryption['Rules'][0]['ApplyServerSideEncryptionByDefault']) + ' added to bucket\n'
 
+
 def check_for_s3_inventory(bucketname, target_policy):
     global message
     try:
@@ -127,6 +130,7 @@ def check_for_s3_inventory(bucketname, target_policy):
                     return True
         return False
 
+
 def apply_s3_inventory(bucketname, target_policy):
     global message
     try:
@@ -136,6 +140,7 @@ def apply_s3_inventory(bucketname, target_policy):
         print(e)
     else:
         message += 'S3 Inventory Policy added to bucket, delivering inventory reports to ' + target_policy['InventoryConfiguration']['Destination']['S3BucketDestination']['Bucket'] + '\n'
+
 
 def check_bucket_policy_statement_public(statement):
     global message
@@ -150,6 +155,7 @@ def check_bucket_policy_statement_public(statement):
         else:
             return True                 
     return False
+
 
 def check_bucket_policy(bucketname):
     global message
@@ -170,13 +176,14 @@ def check_bucket_policy(bucketname):
                 message += 'Warning! Bucket allows public access via bucket policy.\n'
         return bucket_policy
 
+
 def check_bucket_ACL_public(bucketname):
     global message
     try:
         bucket_acl = s3.get_bucket_acl(Bucket=bucketname)
     except Exception as e:
         print(e)
-    else:   
+    else:
         bucket_acl_public = []
         if bucket_acl:
             for grant in bucket_acl["Grants"]:
@@ -185,11 +192,12 @@ def check_bucket_ACL_public(bucketname):
                     bucket_acl_public.append(grant)
         return bucket_acl_public
 
+
 def handler(event, context):
     global message
     global message_attachment
     print(json.dumps(event))
-    
+
     if 'detail' in event:
         eventName = event['detail']['eventName']
         bucketname = event['detail']['requestParameters']['bucketName']
@@ -275,9 +283,9 @@ def handler(event, context):
 
                 print(message)
 
-                if SLACK==True:
+                if SLACK is True:
                     slack_message = {
-                        'text' : message,
+                        'text': message,
                         'mrkdwn': True,
                         'channel': slack_channel,
                         'username': 'S3 Bucket Configuration Audit Bot',
@@ -307,4 +315,3 @@ def handler(event, context):
                           print('Error!  Failed to alert slack channel: %d %s', exc.code, exc.reason)
                         except URLError as exc:
                           print('Error!  Failed to alert slack channel.  Server connection failed: %s', exc.reason)
-

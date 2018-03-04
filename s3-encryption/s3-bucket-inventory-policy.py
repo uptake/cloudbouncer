@@ -36,13 +36,13 @@ import json
 import datetime
 import os
 
-if args['-h']==True or args['--help']==True:
+if args['-h'] is True or args['--help'] is True:
 	print(__doc__)
 
 ABORT = False
-if args['audit']==True:
+if args['audit'] is True:
     mode = 'audit'
-elif args['apply']==True:
+elif args['apply'] is True:
     mode = 'apply'
 else:
     print('No mode specified')
@@ -64,7 +64,7 @@ else:
 
 if args['<frequency>'] not in ['Weekly','Daily']:
 	print('Invalid frequency, must be Weekly or Daily')
-	ABORT=True
+	ABORT = True
 
 target_policy = {
 	'Id': args['<inventory_rule_name>'],
@@ -87,12 +87,11 @@ target_policy = {
 	}
 }
 
-if args['--allversions']==True:
+if args['--allversions'] is True:
 	target_policy['InventoryConfiguration']['IncludedObjectVersions'] = 'All'
 
 if args['--format'] is not None and args['--format'] in ['ORC', 'CSV']:
 	target_policy['InventoryConfiguration']['Destination']['S3BucketDestination']['Format'] = args['--format']
-
 
 
 def load_file(filename, purpose):
@@ -117,7 +116,7 @@ if mode == 'apply':
 	lambda_env_var['Variables']['S3_INVENTORY_RULE_NAME'] = args['<inventory_rule_name>']
 	lambda_env_var['Variables']['S3_INVENTORY_BUCKET_PREFIX'] = args['<inventory_buckets_prefix>']
 
-	if args['--allversions']==True:
+	if args['--allversions'] is True:
 		lambda_env_var['Variables']['S3_INVENTORY_VERSIONING'] = 'All'
 	else:
 		lambda_env_var['Variables']['S3_INVENTORY_VERSIONING'] = 'Current'
@@ -134,6 +133,7 @@ if mode == 'apply':
 	lamba_env_var_file.write(json.dumps(lambda_env_var,indent=4,separators=(',', ': ')))
 	lamba_env_var_file.close()
 
+
 def check_for_s3_inventory():
 	try:
 		inventories = s3.list_bucket_inventory_configurations(
@@ -149,6 +149,7 @@ def check_for_s3_inventory():
 					return True
 	return False
 
+
 def apply_s3_inventory():
 	try:
 		response = s3.put_bucket_inventory_configuration(**target_policy)
@@ -162,7 +163,7 @@ def apply_s3_inventory():
 
 inventories = {}
 
-if ABORT == False:
+if ABORT is False:
 	for account in accounts:
 		session = boto3.session.Session(profile_name=account)
 		s3 = session.client('s3')

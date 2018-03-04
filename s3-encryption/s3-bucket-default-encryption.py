@@ -31,13 +31,13 @@ import json
 import datetime
 import os
 
-if args['-h']==True or args['--help']==True:
+if args['-h'] is True or args['--help'] is True:
     print(__doc__)
 
 ABORT = False
-if args['audit']==True:
+if args['audit'] is True:
     mode = 'audit'
-elif args['apply']==True:
+elif args['apply'] is True:
     mode = 'apply'
 else:
     print('No mode specified')
@@ -57,12 +57,12 @@ if args['<bucket_names>']:
 else:
     target_buckets = []
 
-if args['--filename']!=None:
+if args['--filename'] is not None:
     filename = args['--filename']
 else:
     filename = ''
 
-if args['--kms']!=None:
+if args['--kms'] is not None:
     target_encryption = {
         'Rules': [
             {
@@ -84,6 +84,7 @@ else:
         ]
     }
 
+
 def load_file(filename, purpose):
     try:
         file = open(filename, 'r')
@@ -100,6 +101,7 @@ def load_file(filename, purpose):
             file.close()
             return value
 
+
 if mode=='apply':
     lambda_env_var = load_file('lambda-env-variables.txt', 'Lambda Env Variables')
     if args['--kms']!=None:
@@ -108,10 +110,12 @@ if mode=='apply':
     lamba_env_var_file.write(json.dumps(lambda_env_var,indent=4,separators=(',', ': ')))
     lamba_env_var_file.close()
 
+
 def json_serial(obj):
     """JSON serializer for objects not serializable by default json code"""
     if isinstance(obj, (datetime.datetime, datetime.date)):
         return obj.isoformat()
+
 
 def check_default_encryption(account, bucket):
     try:
@@ -134,6 +138,7 @@ def check_default_encryption(account, bucket):
         else:
             return False
 
+
 def fix_default_encryption(account, bucket):
     try:
         s3.put_bucket_encryption(
@@ -153,7 +158,7 @@ def fix_default_encryption(account, bucket):
 
 s3_default_encryption = {}
 
-if ABORT==False:
+if ABORT is False:
     for account in accounts:
         session = boto3.session.Session(profile_name=account) #set profile per account
         s3 = session.client('s3')
@@ -171,19 +176,19 @@ if ABORT==False:
                 if not target_buckets or bucket['Name'] in target_buckets:
                     s3_default_encryption[account]['Buckets'].append({'Bucket':bucket['Name'],'DefaultEncryption':[]})
                     current_policy = check_default_encryption(account, bucket)
-                    if current_policy == False:
+                    if current_policy is False:
                         if mode == 'audit':
                             print(account + ' ' + bucket['Name'] + ' does NOT have any default encryption policy')
                         if mode == 'apply':
-                            if fix_default_encryption(account, bucket) == True:
+                            if fix_default_encryption(account, bucket) is True:
                                 s3_default_encryption[account]['Buckets'][bucket_count]['DefaultEncryption'] = target_encryption['Rules'][0]['ApplyServerSideEncryptionByDefault']
-                    elif current_policy == True:
+                    elif current_policy is True:
                         print(account + ' ' + bucket['Name'] + ' already has the target default encryption policy')
                         s3_default_encryption[account]['Buckets'][bucket_count]['DefaultEncryption'] = target_encryption['Rules'][0]['ApplyServerSideEncryptionByDefault']
                     else:
                         print(account + ' ' + bucket['Name'] + ' already has a default encryption policy of ' + json.dumps(current_policy) + ' but that does not match target policy ' + json.dumps(target_encryption['Rules'][0]['ApplyServerSideEncryptionByDefault']))
-                        if mode == 'apply' and args['--force'] == True:
-                            if fix_default_encryption(account, bucket) == True:
+                        if mode == 'apply' and args['--force'] is True:
+                            if fix_default_encryption(account, bucket) is True:
                                     s3_default_encryption[account]['Buckets'][bucket_count]['DefaultEncryption'] = target_encryption['Rules'][0]['ApplyServerSideEncryptionByDefault']
                             else:
                                 s3_default_encryption[account]['Buckets'][bucket_count]['DefaultEncryption'] = current_policy
