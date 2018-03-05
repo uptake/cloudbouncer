@@ -58,13 +58,13 @@ import urllib
 import multiprocessing
 import os
 
-if args['-h']==True or args['--help']==True:
+if args['-h'] is True or args['--help'] is True:
 	print(__doc__)
 
 ABORT = False
-if args['audit']==True:
+if args['audit'] is True:
     mode = 'audit'
-elif args['apply']==True:
+elif args['apply'] is True:
     mode = 'apply'
 else:
     print('No mode specified')
@@ -80,7 +80,7 @@ else:
         ABORT = True
 
 if args['--buckets'] is not None:
-    target_buckets =  args['--buckets'].split(',')
+    target_buckets = args['--buckets'].split(',')
 else:
     target_buckets = []
 
@@ -88,16 +88,18 @@ filename = args['<filename>'] + '_Unencrypted_Objects.txt'
 summary_filename = args['<filename>'] + '_Summary.txt'
 
 
-if args['--kms']!=None:
+if args['--kms'] is not None:
     target_encryption = 'SSE-KMS'
     encryption_key = args['--kms']
 else:
     target_encryption = 'SSE-S3'
 
+
 def json_serial(obj):
     """JSON serializer for objects not serializable by default json code"""
     if isinstance(obj, (datetime.datetime, datetime.date)):
         return obj.isoformat()
+
 
 def get_manifest_file(function_args):
 	bucketname = function_args[0]
@@ -156,6 +158,7 @@ def get_manifest_file(function_args):
 			analyze_no_manifest([bucketname, account])
 			return {'bucket':bucketname, 'manifest':'Error'}
 
+
 def get_bucket_inventory(function_args):
 	# parse actual inventory data file name
 	bucketname = function_args[0]
@@ -196,6 +199,7 @@ def get_bucket_inventory(function_args):
 		counter += 1
 	return {'bucket':bucketname, 'inventory':inventory}
 
+
 def analyze_no_manifest(function_args):
 	bucketname = function_args[0]
 	account = function_args[1]
@@ -211,6 +215,7 @@ def analyze_no_manifest(function_args):
 			print(account + ' ' + bucketname + ' is empty')
 		else:
 			print('Warning! ' + account + ' ' + bucketname + ' is not empty, but has no S3 inventory file.')
+
 
 def check_encryption(function_args):
 	# s3obj[0] = bucket, s3obj[1] = key, s3obj[2] = size, s3obj[5] = storage_class, s3obj[8]=encryption_state
@@ -246,7 +251,8 @@ def check_encryption(function_args):
 		else:
 			print(account + ' ' + bucketname + ' has no unencrypted objects')
 		return {'account': account, 'num_objects':num_objects_bucket}
-	
+
+
 def parallel_encryption_audit(function_args):
 	bucketname = function_args[0]
 	inventory_bucket = function_args[1]
@@ -260,10 +266,11 @@ def parallel_encryption_audit(function_args):
 			bucket_results = check_encryption([bucketname, account, inventory['inventory']])
 			return bucket_results
 
+
 unencrypted_objects = {}
 num_objects = {}
 
-if ABORT == False and mode == 'audit':
+if ABORT is False and mode == 'audit':
 	summary_string = ''
 	pool = multiprocessing.Pool()
 	buckets_to_analyze = []
@@ -305,7 +312,7 @@ if ABORT == False and mode == 'audit':
 
 	for account in accounts:
 		account_unencrypted_objects = len(unencrypted_objects[account])
-		if args['--pedantic'] == True:
+		if args['--pedantic'] is True:
 			if account_unencrypted_objects >0:
 				summary_string += account + ' account has ' + str(account_unencrypted_objects) + ' unencrypted (or wrongly encrypted) objects as of ' + str(datetime.date.today().isoformat()) + ', representing ' + str(account_unencrypted_objects/num_objects[account]*100) + ' percent of the ' +  str(num_objects[account]) + ' objects in all S3 buckets in the account\n'
 			else:
@@ -323,6 +330,7 @@ if ABORT == False and mode == 'audit':
 	summary = open(summary_filename, 'w')
 	summary.write(summary_string)
 
+
 def parallel_encryption_enforcement(function_args):
 	account = function_args[0]
 	s3object = function_args[1]
@@ -338,31 +346,32 @@ def parallel_encryption_enforcement(function_args):
 		return {'s3object':s3object, 'status':'error'}
 	else:
 		if s3object[2] <= 5368709120:
-			if check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) == False:		
-				if s3object_set_encryption(object_metadata, s3object[1], s3object[0]) == False:
+			if check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) is False:		
+				if s3object_set_encryption(object_metadata, s3object[1], s3object[0]) is False:
 					return {'s3object':s3object, 'status':'error'}
 				else:
 					return {'s3object':s3object, 'status':'encrypted'}
 			elif check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) == 'pseudo':
-				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) == False:
+				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) is False:
 					return {'s3object':s3object, 'status':'error'}
 				else:
 					return {'s3object':s3object, 'status':'encrypted'}
 			else:
 				return {'s3object':s3object, 'status':'encrypted'}
 		else:
-			if check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) == False:		
-				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) == False:
+			if check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) is False:		
+				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) is False:
 					return {'s3object':s3object, 'status':'error'}
 				else:
 					return {'s3object':s3object, 'status':'encrypted'}
-			elif check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) == 'pseudo' and args['--pedantic']==True:
-				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) == False:
+			elif check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) == 'pseudo' and args['--pedantic'] is True:
+				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) is False:
 					return {'s3object':s3object, 'status':'error'}
 				else:
 					return {'s3object':s3object, 'status':'encrypted'}
 			else:
 				return {'s3object':s3object, 'status':'encrypted'}
+
 
 def check_for_encryption_realtime(object_metadata, s3objectkey, bucketname):
 	if 'StorageClass' in object_metadata:
@@ -379,6 +388,7 @@ def check_for_encryption_realtime(object_metadata, s3objectkey, bucketname):
 			return True
 		else:
 			return 'sorta'
+
 
 def s3object_set_encryption(object_metadata, s3objectkey, bucketname):
 	# Retain storage class if set
@@ -454,7 +464,7 @@ def s3object_set_encryption_large(object_metadata, s3objectkey, bucketname):
 		)
 	except Exception as e:
 		print(e)
-	
+
 	config = boto3.s3.transfer.TransferConfig(
 		multipart_threshold=8388608,
 		max_concurrency=10,
@@ -516,12 +526,13 @@ def s3object_set_encryption_large(object_metadata, s3objectkey, bucketname):
 			print(e)
 			return False
 		else:
-			if check_for_encryption_realtime(object_metadata, s3objectkey, bucketname) == False:
+			if check_for_encryption_realtime(object_metadata, s3objectkey, bucketname) is False:
 				return False
 			else:
-				return True	
+				return True
 
-if ABORT==False and mode == 'apply':
+
+if ABORT is False and mode == 'apply':
 	summary_string = ''
 	try:
 		results = open(filename, 'r')
@@ -563,10 +574,9 @@ if ABORT==False and mode == 'apply':
 							error_count += 1
 							new_unencrypted_objects[account].append(result['s3object'])
 						elif result['status'] == 'pseudo':
-							if args['--pedantic'] == True:
+							if args['--pedantic'] is True:
 								error_count += 1
 								new_unencrypted_objects[account].append(result['s3object'])
-
 
 					print('Successfully encrypted ' + str(encrypted_count) + ' objects out of ' + str(number_unencrypted_account) + ' in account ' + account + ', ' + str(error_count) + ' errors, ' + str(skipped_count) + ' skipped.')
 					summary_string+='Successfully encrypted ' + str(encrypted_count) + ' objects out of ' + str(number_unencrypted_account) + ' in account ' + account + ', ' + str(error_count) + ' errors, ' + str(skipped_count) + ' skipped.\n'
@@ -582,8 +592,3 @@ if ABORT==False and mode == 'apply':
 			output_file.write(json.dumps(new_unencrypted_objects))
 
 	print('\n\n' + summary_string)
-
-
-
-
-
