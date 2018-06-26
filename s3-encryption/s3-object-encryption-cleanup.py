@@ -132,7 +132,7 @@ def get_manifest_file(function_args):
 			if last_modified_manifest:
 				manifest_location = last_modified_manifest['Key']
 
-				local_manifest_filename = 'Inventories/'+bucketname+'-manifest.json'
+				local_manifest_filename = bucketname+'-manifest.json'
 				try:
 					manifest = s3.download_file(inventory_bucket, manifest_location, local_manifest_filename)
 				except Exception as e:
@@ -151,6 +151,11 @@ def get_manifest_file(function_args):
 							print(e)
 						else:
 							local_manifest_file.close()
+							try:
+								os.remove(local_manifest_filename)
+							except Exception as e:
+								print(e)
+
 							return {'bucket':bucketname, 'manifest':manifest, 'inventory_bucket':inventory_bucket}
 			else:
 				analyze_no_manifest([bucketname, account])
@@ -177,7 +182,7 @@ def get_bucket_inventory(function_args):
 
 	for inventory_file in manifest['files']:
 		inventory_s3_filename = inventory_file['key']
-		local_inventory_filename = 'Inventories/'+bucketname+'-inventory_'+str(counter)+'.csv.gz'
+		local_inventory_filename = bucketname+'-inventory_'+str(counter)+'.csv.gz'
 		try:
 			report = s3.download_file(inventory_bucket, inventory_s3_filename, local_inventory_filename)
 		except Exception as e:
@@ -197,6 +202,11 @@ def get_bucket_inventory(function_args):
 				for line in inventory_csv:
 					inventory.append(line)
 				local_inventory_file.close()
+
+				try:
+					os.remove(local_inventory_filename)
+				except Exception as e:
+					print(e)
 		counter += 1
 	return {'bucket':bucketname, 'inventory':inventory, 'schema':manifest['fileSchema']}
 
