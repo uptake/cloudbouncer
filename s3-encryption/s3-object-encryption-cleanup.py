@@ -57,6 +57,7 @@ import csv
 import urllib
 import multiprocessing
 import os
+from itertools import izip as zip #can use native zip in 3
 
 if args['-h'] is True or args['--help'] is True:
 	print(__doc__)
@@ -197,7 +198,7 @@ def get_bucket_inventory(function_args):
 					inventory.append(line)
 				local_inventory_file.close()
 		counter += 1
-	return {'bucket':bucketname, 'inventory':inventory}
+	return {'bucket':bucketname, 'inventory':inventory, 'schema':manifest['fileSchema']}
 
 
 def analyze_no_manifest(function_args):
@@ -218,11 +219,17 @@ def analyze_no_manifest(function_args):
 
 
 def check_encryption(function_args):
-	# s3obj[0] = bucket, s3obj[1] = key, s3obj[2] = size, s3obj[5] = storage_class, s3obj[8]=encryption_state
-
 	bucketname = function_args[0] 
 	account = function_args[1]
 	inventory = function_args[2]
+	schema = function_args[3].replace(" ","").split(',')
+
+	bucket = schema.index('Bucket')
+	key = schema.index('Key')
+	size = schema.index('Size')
+	storage_class = schema.index('StorageClass')
+	encryption_state = schema.index('EncryptionStatus')
+	# s3obj[0] = bucket, s3obj[1] = key, s3obj[2] = size, s3obj[5] = storage_class, s3obj[8]=encryption_state  # only holds for current version
 
 	global summary_string
 	num_objects_bucket = float(len(inventory))
@@ -230,14 +237,14 @@ def check_encryption(function_args):
 	unencrypted_objects_in_bucket = []
 
 	for s3obj in inventory:
-		if s3obj[8] == 'NOT-SSE':
-			if s3obj[5] != 'GLACIER' and s3obj[2] > 0:
+		if s3obj[encryption_state] == 'NOT-SSE':
+			if s3obj[storage_class] != 'GLACIER' and s3obj[size] > 0:
 				unencrypted_objects_bucket += 1
-				unencrypted_objects_in_bucket.append(s3obj)
-		elif s3obj[8] != target_encryption:
+				unencrypted_objects_in_bucket.append({k:v for k,v in zip(schema,s3obj)})
+		elif s3obj[encryption_state] != target_encryption:
 			if args['--pedantic']==True:
 				unencrypted_objects_bucket += 1
-				unencrypted_objects_in_bucket.append(s3obj)
+				unencrypted_objects_in_bucket.append({k:v for k,v in zip(schema,s3obj)})
 
 	if unencrypted_objects_bucket > 0:
 		if args['--pedantic']==True:
@@ -263,7 +270,7 @@ def parallel_encryption_audit(function_args):
 	if manifest['manifest'] != 'Error':
 		inventory = get_bucket_inventory([bucketname,inventory_bucket, manifest['manifest'], account])
 		if inventory['inventory'] != 'Error':
-			bucket_results = check_encryption([bucketname, account, inventory['inventory']])
+			bucket_results = check_encryption([bucketname, account, inventory['inventory'], inventory['schema']])
 			return bucket_results
 
 
@@ -324,7 +331,7 @@ if ABORT is False and mode == 'audit':
 				summary_string += account + ' account has no unencrypted objects as of ' + str(datetime.date.today().isoformat()) + ', representing 0 percent of the ' +  str(num_objects[account]) + ' objects in all S3 buckets in the account\n'
 
 	output_file = open(filename, 'w')
-	output_file.write(json.dumps(unencrypted_objects,indent=4, separators=(',', ': ')))
+	output_file.write(json.dumps(unencrypted_objects))
 
 	print('\n\n'+summary_string)
 	summary = open(summary_filename, 'w')
@@ -336,36 +343,35 @@ def parallel_encryption_enforcement(function_args):
 	s3object = function_args[1]
 
 	s3_account = boto3.session.Session(profile_name=account).client('s3')
-	# s3object[0] = bucket, s3object[1] = key, s3object[2] = size
 	try:
-		object_metadata = s3_account.head_object(Bucket=s3object[0],Key=s3object[1])
+		object_metadata = s3_account.head_object(Bucket=s3object['Bucket'],Key=s3object['Key'])
 	except Exception as e:
 		# Figure out how to silence 404 errors for deleted objects
-		print('An error occured when trying to retrieve the metadata for ' + s3object[1] + ' in bucket ' + s3object[0])
+		print('An error occured when trying to retrieve the metadata for ' + s3object['Key'] + ' in bucket ' + s3object['Bucket'])
 		print(e)
 		return {'s3object':s3object, 'status':'error'}
 	else:
-		if s3object[2] <= 5368709120:
-			if check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) is False:		
-				if s3object_set_encryption(object_metadata, s3object[1], s3object[0]) is False:
+		if s3object['Size'] <= 5368709120:
+			if check_for_encryption_realtime(object_metadata, s3object['Key'], s3object['Bucket']) is False:		
+				if s3object_set_encryption(s3_account, object_metadata, s3object['Key'], s3object['Bucket']) is False:
 					return {'s3object':s3object, 'status':'error'}
 				else:
 					return {'s3object':s3object, 'status':'encrypted'}
-			elif check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) == 'pseudo':
-				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) is False:
+			elif check_for_encryption_realtime(object_metadata, s3object['Key'], s3object['Bucket']) == 'pseudo':
+				if s3object_set_encryption_large(s3_account, object_metadata, s3object['Key'], s3object['Bucket']) is False:
 					return {'s3object':s3object, 'status':'error'}
 				else:
 					return {'s3object':s3object, 'status':'encrypted'}
 			else:
 				return {'s3object':s3object, 'status':'encrypted'}
 		else:
-			if check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) is False:		
-				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) is False:
+			if check_for_encryption_realtime(object_metadata, s3object['Key'], s3object['Bucket']) is False:		
+				if s3object_set_encryption_large(s3_account, object_metadata, s3object['Key'], s3object['Bucket']) is False:
 					return {'s3object':s3object, 'status':'error'}
 				else:
 					return {'s3object':s3object, 'status':'encrypted'}
-			elif check_for_encryption_realtime(object_metadata, s3object[1], s3object[0]) == 'pseudo' and args['--pedantic'] is True:
-				if s3object_set_encryption_large(object_metadata, s3object[1], s3object[0]) is False:
+			elif check_for_encryption_realtime(object_metadata, s3object['Key'], s3object['Bucket']) == 'pseudo' and args['--pedantic'] is True:
+				if s3object_set_encryption_large(s3_account, object_metadata, s3object['Key'], s3object['Bucket']) is False:
 					return {'s3object':s3object, 'status':'error'}
 				else:
 					return {'s3object':s3object, 'status':'encrypted'}
@@ -387,10 +393,10 @@ def check_for_encryption_realtime(object_metadata, s3objectkey, bucketname):
 		elif object_metadata['ServerSideEncryption'] == 'aws:kms'  and target_encryption == 'SSE-KMS' and object_metadata['SSEKMSKeyId'] == encryption_key:
 			return True
 		else:
-			return 'sorta'
+			return 'pseudo'
 
 
-def s3object_set_encryption(object_metadata, s3objectkey, bucketname):
+def s3object_set_encryption(s3_account, object_metadata, s3objectkey, bucketname):
 	# Retain storage class if set
 	if 'StorageClass' in object_metadata:
 		storageclass = object_metadata['StorageClass']
@@ -440,7 +446,7 @@ def s3object_set_encryption(object_metadata, s3objectkey, bucketname):
 			return False
 
 
-def s3object_set_encryption_large(object_metadata, s3objectkey, bucketname):
+def s3object_set_encryption_large(s3_account, object_metadata, s3objectkey, bucketname):
 	# Retain storage class if set
 	if 'StorageClass' in object_metadata:
 		storageclass = object_metadata['StorageClass']
@@ -561,7 +567,7 @@ if ABORT is False and mode == 'apply':
 
 					target_objects = []
 					for s3object in range(len(unencrypted_objects[account])):
-						unencrypted_objects[account][s3object][1] = urllib.unquote_plus(unencrypted_objects[account][s3object][1].encode('utf8'))
+						unencrypted_objects[account][s3object]['Key'] = urllib.unquote_plus(unencrypted_objects[account][s3object]['Key'].encode('utf8'))
 						target_objects.append([account, unencrypted_objects[account][s3object]])
 
 					new_unencrypted_objects[account] = []
