@@ -1,0 +1,13 @@
+{
+    "Variables": {
+        "SLACK_WEBHOOK": "https://hooks.slack.com/services/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",
+        "S3_INVENTORY_BUCKET_PREFIX": "uptake-s3inventory",
+        "S3_INVENTORY_FORMAT": "CSV",
+        "S3_INVENTORY_VERSIONING": "Current",
+        "S3_INVENTORY_ACCOUNT": "647720091822",
+        "SLACK_CHANNEL": "#securecloud-alerts",
+        "S3_INVENTORY_RULE_NAME": "uptake-security-audit",
+        "DEFAULT_ENCRYPTION_KMS": "string",
+        "S3_INVENTORY_FREQUENCY": "Daily"
+    }
+}

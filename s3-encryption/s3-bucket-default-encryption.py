@@ -103,10 +103,10 @@ def load_file(filename, purpose):
 
 
 if mode=='apply':
-    lambda_env_var = load_file('lambda-env-variables.txt', 'Lambda Env Variables')
-    if args['--kms']!=None:
+    lambda_env_var = load_file('s3-bucket-configuration-bot/lambda-env-variables.txt', 'Lambda Env Variables')
+    if args['--kms'] is not None:
         lambda_env_var['Variables']['DEFAULT_ENCRYPTION_KMS']=args['--kms']
-    lamba_env_var_file = open('lambda-env-variables.txt', 'w')
+    lamba_env_var_file = open('s3-bucket-configuration-bot/lambda-env-variables.txt', 'w')
     lamba_env_var_file.write(json.dumps(lambda_env_var,indent=4,separators=(',', ': ')))
     lamba_env_var_file.close()
 

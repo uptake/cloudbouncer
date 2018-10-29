@@ -3,22 +3,14 @@
 deploy-bot: lets you deploy a cloudwatch triggered lambda bot to all regions of all accounts with all dependencies
 
 Usage: 
-  deploy-bot deploy <botname> [--accounts=<>] [--iampolicy=<>] [--cloudwatchrule=<>] [--multiregion]
-  deploy-bot set-env-var [--slackwebhook=<>] [--slackchannel=<>] [--kms=<>] [--inventory_account=<>] [--inventory_buckets_prefix=<>] [--inventory_rule_name=<>] [--frequency=<>] [--allversions] [--format=<>']
+  deploy-bot deploy <botname> [--accounts=<> --iampolicy=<> --cloudwatchrule=<> --cron --multiregion --govcloud]
+  deploy-bot update <botname> [--lambda --iam --cloudwatch --accounts=<> --multiregion --govcloud]
+  deploy-bot delete <botname> [--accounts=<> --multiregion --govcloud]
+  deploy-bot set-env-var <botname> [--slackwebhook=<> --slackchannel=<>]
   deploy-bot -h | --help
 
-  set-env-var mode lets you optionally edit the lambda environment variables that were stored the last time you applied either default encryption or inventory policies
-  Running 'set-env-var' with no parameters will output the current environment variables.  You can also edit them in the 'lambda-env-variables.txt' file
-  Any variables not set will be omitted from lambda if not required, otherwise it will fail:
-    "SLACK_WEBHOOK", # Optional, will output to CloudWatch logs if not present
-    "SLACK_CHANNEL", # Optional, will output to CloudWatch logs if not present.   
-    "DEFAULT_ENCRYPTION_KMS", # Optional kmskeyid, defaults to SSE-AES256 if not set
-    "S3_INVENTORY_ACCOUNT", # Optional accountID, assumes your inventory buckets are in this account if not set.   
-    "S3_INVENTORY_BUCKET_PREFIX", # Required
-    "S3_INVENTORY_RULE_NAME", #Required
-    "S3_INVENTORY_FREQUENCY", # Required, "Daily" | "Weekly"
-    "S3_INVENTORY_FORMAT", #Required, "CSV" | "ORC"
-    "S3_INVENTORY_VERSIONING", #Required, "Current" | "All"
+  set-env-var mode lets you optionally edit the lambda environment variables, you can also edit them in <botname>/lambda-env-variables.txt' file 
+  Any variables not set will be omitted from lambda if not required, otherwise the deployment will fail.
 
 Arguments for deploy:
   <botname>           # Name of the bot (assumes name.py for Lambda code file), and names all associated resources in all AWS services associated with it as botname
@@ -26,14 +18,18 @@ Arguments for deploy:
   --iampolicy=<>      # Optionally specify the text file containing the IAM policy you want your Lambda function to use, in valid JSON, defaults to 'iampolicy.txt'
   --cloudwatchrule=<> # Optionally specify the text file containing the pattern you want your Cloudwatch Rule to use, in valid JSON, defaults to 'cloudwatchrule.txt'
   --multiregion       # Optionally specify that you want to deploy the bot to all current regions, defaults to False and uses AWS_REGION env. variable
-  
+  --cron              # Optional, set the cloudwatch trigger as a cron job instead of the default event pattern
+  --lambda            # for update mode, update only the lambda code
+  --iam               # for update mode, update only the IAM policy
+  --cloudwatch        # for update mode, update only the cloudwatch rule
+  --govcloud          # switches the provider in all arns from 'aws' to 'aws-us-gov'
+
 Examples:
   $ deploy-bot s3-bucket-configuration-bot --accounts=dev,qa,prd --multiregion
-  $ deploy-bot set-env-var 
-  $ deploy-bot set-env-var --slackwebhook=webhookurl --slackchannel=#channelname --kms=kmskeyid --inventory_account=123456789 --inventory_buckets_prefix=myorg-s3inventory --inventory_rule_name=audit --frequency=Daily
-
+  $ deploy-bot s3-bucket-configuration-bot set-env-var 
 
 """
+
 from docopt import docopt
 args = docopt(__doc__)
 
@@ -47,323 +43,398 @@ import datetime
 import time
 import subprocess
 import os
+import multiprocessing
 
+path = args['<botname>'] + '/'
 
 def load_file(filename, purpose):
-	try:
-		file = open(filename, 'r')
-	except Exception as e:
-		print(e)
-	else:
-		try:
-			value = json.load(file)
-		except Exception as e:
-			print('Loading ' + purpose + ' file failed:')
-			print(e)
-			ABORT = True
-		else:
-			file.close()
-			return value
-
+    try:
+        file = open(filename, 'r')
+    except Exception as e:
+        print(e)
+    else:
+        try:
+            value = json.load(file)
+        except Exception as e:
+            print('Loading ' + purpose + ' file failed:')
+            print(e)
+            ABORT = True
+        else:
+            file.close()
+            return value
 
 def validate_file(filename):
-	try:
-		results_file = open(filename, 'r')
-	except Exception as e:
-		print('Loading Lambda code file ' + filename + ' failed, aborted')
-		print(e)
-		return False
-	else:
-		results_file.close()
-		return True
-
-possible_environment_variables = [
-	"SLACK_WEBHOOK", # Optional, will output to CloudWatch logs if not present
-	"SLACK_CHANNEL", # Optional, will output to CloudWatch logs if not present
-	"DEFAULT_ENCRYPTION_KMS", # Optional kmskeyid, defaults to SSE-AES256 if not set
-	"S3_INVENTORY_ACCOUNT", # Optional accountID, assumes your inventory buckets are in this account if not set
-	"S3_INVENTORY_BUCKET_PREFIX", # Required
-	"S3_INVENTORY_RULE_NAME", #Required
-	"S3_INVENTORY_FREQUENCY", # Required, "Daily" | "Weekly"
-	"S3_INVENTORY_FORMAT", #Required, "CSV" | "ORC"
-	"S3_INVENTORY_VERSIONING", #Required, "Current" | "All"
-]
+    try:
+        results_file = open(filename, 'r')
+    except Exception as e:
+        print('Loading Lambda code file ' + filename + ' failed, aborted')
+        print(e)
+        return False
+    else:
+        results_file.close()
+        return True
 
 if args['set-env-var'] is True:
-	lambda_env_var = load_file('lambda-env-variables.txt', 'Lambda Environment Variables')
+    lambda_env_var = load_file(path+'lambda-env-variables.txt', 'Lambda Environment Variables')
 
-	print('Lambda environment variables were: ')
-	print(json.dumps(lambda_env_var, indent=4))
+    print('Enter new values for environment variables, press enter to keep current')
+    for var in lambda_env_var['Variables']:
+        print(var)
+        print('\tDescription: ' + lambda_env_var['Help'][var])
+        print('\tCurrent value: '+ lambda_env_var['Variables'][var])
+        print('\tNew value: (enter to keep current)')
+        new_value = raw_input()
+        if new_value:
+            lambda_env_var['Variables'][var] = new_value
 
-	if args['--slackwebhook'] is not None:
-		lambda_env_var['Variables']['SLACK_WEBHOOK'] = args['--slackwebhook']
+    print('Lamba environment variables are now: ')
+    print(json.dumps(lambda_env_var['Variables'], indent=4))
 
-	if args['--slackchannel'] is not None:
-		lambda_env_var['Variables']['SLACK_CHANNEL'] = args['--slackchannel']
+    lamba_env_var_file = open(path+'lambda-env-variables.txt', 'w')
+    lamba_env_var_file.write(json.dumps(lambda_env_var,indent=4,separators=(',', ': ')))
+    lamba_env_var_file.close()
 
-	if args['--kms'] is not None:
-		lambda_env_var['Variables']['DEFAULT_ENCRYPTION_KMS']=args['--kms']
+    ABORT = True
 
-	if args['--allversions']==True:
-		lambda_env_var['Variables']['S3_INVENTORY_VERSIONING'] = 'All'
-	else:
-		lambda_env_var['Variables']['S3_INVENTORY_VERSIONING'] = 'Current'
+if args['deploy'] is True or args['update'] is True or args['delete'] is True:
+    ABORT = False
 
-	if args['--format'] is not None and args['--format'] in ['ORC', 'CSV']:
-		lambda_env_var['Variables']['S3_INVENTORY_FORMAT'] = args['--format']
-	else:
-		lambda_env_var['Variables']['S3_INVENTORY_FORMAT'] = 'CSV'
+    if args['--accounts']:
+        accounts = args['--accounts'].split(',')
+    else:
+        if 'AWS_PROFILE' in os.environ:
+            accounts = os.environ['AWS_PROFILE'].split(',')
+        else:
+            print('You did not specify --accounts and also do not have AWS_PROFILE exported to environmental variables')
+            ABORT = True
 
-	if args['--inventory_account'] is not None:
-		lambda_env_var['Variables']['S3_INVENTORY_ACCOUNT'] = args['--inventory_account']
+    # Shared variables
+    name = args['<botname>']
 
-	if args['--frequency'] is not None:
-		lambda_env_var['Variables']['S3_INVENTORY_FREQUENCY'] = args['--frequency']
+    if args['--multiregion'] is True:
+        multiregion = True
+    else:
+        multiregion = False
+        region = os.environ['AWS_REGION']
 
-	if args['--inventory_rule_name'] is not None:
-		lambda_env_var['Variables']['S3_INVENTORY_RULE_NAME'] = args['--inventory_rule_name']
+    # Lambda Variables #
+    current_code = path + name +'.py'
+    runtime = 'python2.7'
+    lambda_filename = path + name + '.py.zip'
+    handler = name + '.handler'
+    timeout = 300
+    publish = True
 
-	if args['--inventory_buckets_prefix'] is not None:
-		lambda_env_var['Variables']['S3_INVENTORY_BUCKET_PREFIX'] = args['inventory_buckets_prefix']
+    # IAM Variables #
+    trust_policy = {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Service": "lambda.amazonaws.com"
+          },
+          "Action": "sts:AssumeRole"
+        }
+      ]
+    }
 
-	print('Lamba environment variables are now: ')
-	print(json.dumps(lambda_env_var, indent=4))
+    if args['--iampolicy'] is not None:
+        iam_filename = path + args['--iampolicy']
+    else:
+        iam_filename = path + 'iampolicy.txt'
 
-	lamba_env_var_file = open('lambda-env-variables.txt', 'w')
-	lamba_env_var_file.write(json.dumps(lambda_env_var,indent=4,separators=(',', ': ')))
-	lamba_env_var_file.close()
+    # Cloudwatch Variables #
+    if args['--cloudwatchrule']:
+        cloudwatch_filename = path + args['--cloudwatchrule']
+    else:
+        cloudwatch_filename = path + 'cloudwatchrule.txt'
+    state = 'ENABLED'
 
-	ABORT = True
+    if args['deploy'] is True or args['update'] is True:
+        # Test all the input files for validity #
+        if validate_file(current_code) == True:
+            subprocess.call('zip -j ' + lambda_filename + ' ' + current_code, shell=True)
+        else:
+            ABORT = True
+        role_policy = load_file(iam_filename, 'IAM Role Policy')
 
-if args['deploy'] is True:
-	ABORT = False
+        if args['--cron'] is not True:
+            pattern = load_file(cloudwatch_filename, 'Cloudwatch Rule Pattern')
+        else:
+            try:
+                file = open(cloudwatch_filename, 'r')
+            except Exception as e:
+                print(e)
+            else:
+                for rule in file:
+                    pattern = rule
 
-	if args['--accounts']:
-	    accounts = args['--accounts'].split(',')
-	else:
-	    if 'AWS_PROFILE' in os.environ:
-	        accounts = os.environ['AWS_PROFILE'].split(',')
-	    else:
-	        print('You did not specify --accounts and also do not have AWS_PROFILE exported to environmental variables')
-	        ABORT = True
+        load_variables = load_file(path+'lambda-env-variables.txt', 'Lambda Environment Variables')
+        possible_variables = [x for x in load_variables['Variables']]
+        if 'Variables' in load_variables:
+            for key in possible_variables:
+                if load_variables['Variables'][key] == 'string':
+                    load_variables['Variables'].pop(key, None)
+        lambda_environment_variables = {'Variables':load_variables['Variables']}
 
-	# Shared variables
-	name = args['<botname>']   # 's3_bucket_configuration_audit_bot'
+def create_iam_role(account):
+    iam = boto3.session.Session(profile_name=account).client('iam')
 
-	if args['--multiregion'] is True:
-		multiregion = True
-	else:
-		multiregion = False
-		region = os.environ['AWS_REGION']
+    if role_policy:
+        try:
+            response = iam.create_role(RoleName=name,Description=name,AssumeRolePolicyDocument=json.dumps(trust_policy))
+        except Exception as e:
+            if e.response['Error']['Code'] == 'EntityAlreadyExists':
+                print(account + ' IAM role already exists')
+            else:
+                print(e)
+        else:
+            print(account + ' IAM role created')
 
-	# Lambda Variables #
-	current_code = name +'.py'
-	runtime = 'python2.7'
-	lambda_filename = name + '.py.zip'
-	handler = name + '.handler'
-	timeout = 300
-	publish = True
+            # Customer IAM Waiter since one doesn't exist for Roles
+            role_exists = False
+            while role_exists==False:
+                try:
+                    role_details = iam.get_role(RoleName=name)
+                except Exception as e:
+                    pass
+                else:
+                    if role_details['Role']:
+                        role_exists = True
+                time.sleep(15)
 
-	# IAM Variables #
-	trust_policy = {
-	  "Version": "2012-10-17",
-	  "Statement": [
-	    {
-	      "Effect": "Allow",
-	      "Principal": {
-	        "Service": "lambda.amazonaws.com"
-	      },
-	      "Action": "sts:AssumeRole"
-	    }
-	  ]
-	}
+        # Add the actual policy to the the role
+        try:
+            response = iam.put_role_policy(RoleName=name,PolicyName=name,PolicyDocument=json.dumps(role_policy))
+        except Exception as e:
+            print(e)
+        else:
+            print(account + ' IAM policy updated')
 
-	if args['--iampolicy'] is not None:
-		iam_filename = args['--iampolicy']
-	else:
-		iam_filename = 'iampolicy.txt'
+def delete_iam_role(account):
+    iam = boto3.session.Session(profile_name=account).client('iam')
 
-	# Cloudwatch Variables #
-	if args['--cloudwatchrule']:
-		cloudwatch_filename = args['--cloudwatchrule']
-	else:
-		cloudwatch_filename = 'cloudwatchrule.txt'
-	state = 'ENABLED'
-
-	# Test all the input files for validity #
-	if validate_file(current_code) == True:
-		subprocess.call('zip ' + lambda_filename + ' ' + current_code, shell=True)
-	else:
-		ABORT = True
-	role_policy = load_file(iam_filename, 'IAM Role Policy')
-	pattern = load_file(cloudwatch_filename, 'Cloudwatch Rule Pattern')
-
-	lambda_environment_variables = load_file('lambda-env-variables.txt', 'Lambda Environment Variables')
-	for key in possible_environment_variables:
-		if lambda_environment_variables['Variables'][key] == 'string':
-			lambda_environment_variables['Variables'].pop(key, None)
-
-
-def create_iam_role():
-	if role_policy:
-		try:
-			response = iam.create_role(RoleName=name,Description=name,AssumeRolePolicyDocument=json.dumps(trust_policy))
-		except Exception as e:
-			if e.response['Error']['Code'] == 'EntityAlreadyExists':
-				print('This IAM role already exists in account ' + account)
-			else:
-				print(e)
-		else:
-			print('Role ' + name + ' has been created in account ' + account + ', ARN: ' + response['Role']['Arn'])
-
-			# Customer IAM Waiter since one doesn't exist for Roles
-			role_exists = False
-			while(False):
-				try:
-					role_details = iam.get_role(RoleName=name)
-				except Exception as e:
-					pass
-				else:
-					if role_details['Role']:
-						role_exists = True
-				time.sleep(1)
-
-		# Add the actual policy to the the role
-		try:
-			response = iam.put_role_policy(RoleName=name,PolicyName=name,PolicyDocument=json.dumps(role_policy))
-		except Exception as e:
-			print(e)
-		else:
-			print('Updated policy for IAM role in account ' + account)
-
-
-def create_lambda_function():
-	try:
-		response = aws_lambda.create_function(
-			FunctionName=name,
-			Runtime=runtime,
-			Role=roleArn,
-			Handler=handler,
-			Code={'ZipFile':open(lambda_filename,'rb').read()},
-			Description=name,
-			Environment=lambda_environment_variables,
-			Timeout=timeout,
-			Publish=publish
-		)
-	except Exception as e:
-		if e.response['Error']['Code'] == 'ResourceConflictException':
-			print('Lambda function already exists in region ' + region + ' in account ' + account)
-			update_lambda_function()
-		else:
-			print(e)
-	else:
-		print('Created lambda function in region ' + region + ' in account ' + account + ', ARN: ' + response['FunctionArn'])
+    try:
+        response = iam.delete_role_policy(RoleName=name,PolicyName=name)
+    except Exception as e:
+        print(e)
+    else:
+        try:
+            response = iam.delete_role(RoleName=name)
+        except Exception as e:
+            print(e)
+        else:
+            print(account + ' IAM role deleted')
 
 
-def update_lambda_function():
-	# Try to update code:
-	try:
-		aws_lambda.update_function_code(
-			FunctionName=name,
-			ZipFile=open(lambda_filename,'rb').read(),
-			Publish=True
-		)
-	except Exception as e:
-		print(e)
-	else:
-		print('Updated lambda function to latest code in region ' + region + ' in account ' + account)
-	try:
-		aws_lambda.update_function_configuration(
-			FunctionName=name,
-			Handler=handler,
-			Environment=lambda_environment_variables,
-		)
-	except Exception as e:
-		print(e)
-	else:
-		print('Updated lambda function configuration in region ' + region + ' in account ' + account)
+def create_lambda_function(f_args):
+    account = f_args[0]
+    region = f_args[1]
+    roleArn = f_args[4]
+    aws_lambda = boto3.session.Session(profile_name=account, region_name=region).client('lambda')
 
-	# Update triggers to include the cloudwatch rule
-	try:
-		permissions_added = aws_lambda.add_permission(
-			FunctionName=name,
-			StatementId=name,
-			Action='lambda:InvokeFunction',
-			Principal='events.amazonaws.com',
-			SourceArn=cloudwatch_arn
-		)
-	except Exception as e:
-		if 'Code' in e.response['Error'] and e.response['Error']['Code'] == 'ResourceConflictException':
-			print('Lambda invoke permissions already exist, did not update')
-			# If updates to permissions ever are needed, add here
-		else:
-			print('Failed to add lambda trigger permissions from CloudWatch to Lambda function in ' + region + ' in ' + account)
-			print(e)
-	else:
-		print('Updated lambda function permissions for in region ' + region + ' in account ' + account + ' to allow CloudWatch triggers')
+    if 'S3_INVENTORY_ACCOUNT' not in lambda_environment_variables['Variables']:
+        lambda_environment_variables['Variables']['S3_INVENTORY_ACCOUNT'] = f_args[5]
 
+    SUCCESS = False
+    while SUCCESS is False:
+        try:
+            response = aws_lambda.create_function(
+                FunctionName=name,
+                Runtime=runtime,
+                Role=roleArn,
+                Handler=handler,
+                Code={'ZipFile':open(lambda_filename,'rb').read()},
+                Description=name,
+                Environment=lambda_environment_variables,
+                Timeout=timeout,
+                Publish=publish
+            )
+        except Exception as e:
+            if e.response['Error']['Code'] == 'ResourceConflictException':
+                print(account + ' ' + region + ' lambda function already exists')
+                update_lambda_function(f_args)
+                SUCCESS = True
+            else:
+                print(e)
+                time.sleep(5)
+        else:
+            print(account + ' ' + region + ' created lambda function ' + response['FunctionArn'])
+            add_lambda_permissions(f_args)
+            SUCCESS = True
+        
+def add_lambda_permissions(f_args):
+    account = f_args[0]
+    region = f_args[1]
+    cloudwatch_arn = f_args[3]
+    roleArn = f_args[4]
+    aws_lambda = boto3.session.Session(profile_name=account, region_name=region).client('lambda')
+    # Update triggers to include the cloudwatch rule
+    try:
+        permissions_added = aws_lambda.add_permission(
+            FunctionName=name,
+            StatementId=name,
+            Action='lambda:InvokeFunction',
+            Principal='events.amazonaws.com',
+            SourceArn=cloudwatch_arn
+        )
+    except Exception as e:
+        if 'Code' in e.response['Error'] and e.response['Error']['Code'] == 'ResourceConflictException':
+            print(account + ' ' + region + ' lambda invoke permissions already exist, did not update')
+            # If updates to permissions ever are needed, add here
+        else:
+            print(account + ' ' + region + ' failed to add lambda trigger permissions from CloudWatch to Lambda function')
+            print(e)
+    else:
+        print(account + ' ' + region + ' updated lambda function permissions to allow CloudWatch triggers')
 
-def create_cloudwatch_targets():
-	try:
-		targets = cw.put_targets(
-			Rule=name,
-			Targets=[
-				{
-					'Id':name,
-					'Arn':lambda_arn
-				}
-			]
-		)
-	except Exception as e:
-		print(e)
-	else:
-		print('Updated target lambda for cloudwatch rule ' + name + ' in region ' + region + ' in account ' + account)
+def update_lambda_function(f_args):
+    account = f_args[0]
+    region = f_args[1]
+    cloudwatch_arn = f_args[3]
+    roleArn = f_args[4]
+    
+    if 'S3_INVENTORY_ACCOUNT' not in lambda_environment_variables['Variables']:
+        lambda_environment_variables['Variables']['S3_INVENTORY_ACCOUNT'] = f_args[5]
 
+    aws_lambda = boto3.session.Session(profile_name=account, region_name=region).client('lambda')
 
-def create_cloudwatch_rule():
-	try:
-		new_rule = cw.put_rule(
-			Name=name,
-			EventPattern=json.dumps(pattern),
-			# ScheduleExpression=schedule,
-			State=state,
-			Description=name,
-		)
-	except Exception as e:
-		print(e)
-	else:
-		print('Updated cloudwatch rule in region ' + region + ' in account ' + account + ', rule ARN = ' + new_rule['RuleArn'])
-		create_cloudwatch_targets()
+    # Update code:
+    try:
+        aws_lambda.update_function_code(
+            FunctionName=name,
+            ZipFile=open(lambda_filename,'rb').read(),
+            Publish=True
+        )
+    except Exception as e:
+        print(e)
+    else:
+        print(account + ' ' + region + ' updated lambda function to latest code')
+    
+    # Update the configuration including environment variables
+    try:
+        aws_lambda.update_function_configuration(
+            FunctionName=name,
+            Handler=handler,
+            Environment=lambda_environment_variables,
+        )
+    except Exception as e:
+        print(e)
+    else:
+        print(account + ' ' + region + ' updated lambda function configuration')
 
+    # Update cloudwatch trigger permissions
+    add_lambda_permissions(f_args)
+    
+def delete_lambda_function(f_args):
+    account = f_args[0]
+    region = f_args[1]
+    aws_lambda = boto3.session.Session(profile_name=account, region_name=region).client('lambda')
+    try:
+        aws_lambda.delete_function(FunctionName=name)
+    except Exception as e:
+        print(e)
+    else:
+        print(account + ' ' + region + ' lambda function deleted')
+
+def create_cloudwatch_targets(f_args):
+    account = f_args[0]
+    region = f_args[1]
+    lambda_arn = f_args[2]
+    cw = boto3.session.Session(profile_name=account, region_name=region).client('events')
+    try:
+        targets = cw.put_targets(
+            Rule=name,
+            Targets=[
+                {
+                    'Id':name,
+                    'Arn':lambda_arn
+                }
+            ]
+        )
+    except Exception as e:
+        print(e)
+    else:
+        print(account + ' ' + region + ' cloudwatch rule target lambda updated')
+
+def create_cloudwatch_rule(f_args):
+    account = f_args[0]
+    region = f_args[1]
+    cw = boto3.session.Session(profile_name=account, region_name=region).client('events')
+
+    # set the arguments based on whether the cloudwatch rule is a cron schedule or event pattern
+    cloudwatch_args = {
+        "Name":name,
+        "State":state,
+        "Description":name
+    }
+    if args['--cron'] is True:
+        cloudwatch_args["ScheduleExpression"] = pattern
+    else:
+        cloudwatch_args["EventPattern"] = json.dumps(pattern)
+
+    try:
+        new_rule = cw.put_rule(**cloudwatch_args)
+    except Exception as e:
+        print(e)
+    else:
+        print(account + ' ' + region + ' cloudwatch rule updated')
+        create_cloudwatch_targets(f_args)
+
+def delete_cloudwatch_rule(f_args):
+    account = f_args[0]
+    region = f_args[1]
+    cw = boto3.session.Session(profile_name=account, region_name=region).client('events')
+
+    try:
+        cw.remove_targets(Rule=name,Ids=[name])
+    except Exception as e:
+        print(e)
+    else:
+        try:
+            new_rule = cw.delete_rule(Name=name)
+        except Exception as e:
+            print(e)
+        else:
+            print(account + ' ' + region + ' cloudwatch rule targets removed and rule deleted')
 
 if ABORT is False: # If everything looks good, try to deploy #
-	for account in accounts:
-		session = boto3.session.Session(profile_name=account) #set profile per account
-		iam = session.client('iam')
-		account_num = session.client('sts').get_caller_identity()['Account']
+    pool = multiprocessing.Pool()
 
-		create_iam_role()
-		roleArn = 'arn:aws:iam::' + account_num + ':role/' + name
+    if args['deploy'] is True or args['--iam'] is True:
+        pool.map(create_iam_role,accounts)
+    if args['delete'] is True:
+        pool.map(delete_iam_role,accounts)
 
-		if 'S3_INVENTORY_ACCOUNT' not in lambda_environment_variables['Variables']:
-			lambda_environment_variables['Variables']['S3_INVENTORY_ACCOUNT'] = account_num
+    targets = []
+    for account in accounts:
+        session = boto3.session.Session(profile_name=account) #set profile per account
+        account_num = session.client('sts').get_caller_identity()['Account']
+        if multiregion == True:
+            regions = session.client('ec2').describe_regions()
+        else:
+            regions = {'Regions':[{'RegionName':region}]}
+        for region in regions['Regions']:
+            region = region['RegionName']
+            if args['--govcloud'] is True:
+                provider = 'aws-us-gov'
+            else:
+                provider = 'aws'
 
-		if multiregion is True:
-			regions = boto3.session.Session(profile_name=account).client('ec2').describe_regions()
-		else:
-			regions = {'Regions':[{'RegionName':region}]}
+            lambda_arn = 'arn:'+provider+':lambda:' + region + ':' + account_num + ':function:' + name
+            cloudwatch_arn = 'arn:'+provider+':events:' + region + ':' + account_num + ':rule/' + name
+            roleArn = 'arn:'+provider+':iam::' + account_num + ':role/' + name
 
-		for region in regions['Regions']:
-			region = region['RegionName']
-			session = boto3.session.Session(profile_name=account, region_name=region) #set profile per account
+            targets.append([account,region,lambda_arn,cloudwatch_arn,roleArn,account_num])
 
-			lambda_arn = 'arn:aws:lambda:' + region + ':' + account_num + ':function:' + name
-			cloudwatch_arn = 'arn:aws:events:' + region + ':' + account_num + ':rule/' + name
+    if args['deploy'] is True or args['--lambda'] is True:
+        pool.map(create_lambda_function,targets)        
+        subprocess.call('rm '+ lambda_filename, shell=True)
 
-			# Create Lambda Functions
-			aws_lambda = session.client('lambda')
-			create_lambda_function()	
+    if args['deploy'] is True or args['--cloudwatch'] is True:
+        pool.map(create_cloudwatch_rule,targets)
 
-			# Create CloudWatch Rules
-			cw = session.client('events')		
-			create_cloudwatch_rule()
+    if args['delete'] is True:
+        pool.map(delete_cloudwatch_rule,targets)
+        pool.map(delete_lambda_function,targets)
