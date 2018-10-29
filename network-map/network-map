@@ -1,0 +1,1025 @@
+#!/usr/bin/env python
+"""
+network-map: build a map of AWS networks and connectivity, and evaluate traffic patterns
+
+Usage: 
+    network-map [--accounts=<>] [-h --help]
+    network-map trace <source_ip> <target> [--target_port=<>] [--sgs] [--flowlogs=<>] [--accounts=<>] [-h --help]
+
+The network-map enumerates all networking constructs within AWS and builds it into a structure that can be used for debugging configurations
+The trace function evaluates all constructs between a <source_ip> address and a target (either DNS or IP), to determine whether traffic will
+flow between these two.  It outputs the specific configurations that AWS is evaluating from the set of NACLs, SGs, routes, etc that affect that
+particular attempted traffic.  This is designed to work primarily for VPC <> VPC connectivity but has support for some internet-facing connectivity.
+It handles all forms of AWS LBs for evaluating the next hop of traffic.
+
+If you use a reverse proxy for DNS, this tool will not work without modifications that evaluate the next hop.  Uptake's private version has this for Cloudflare. 
+
+If you want to check flowlogs, you need VPC flowlogs turned on for each VPC and writing to a CloudWatch Log Group.  You must specify the prefix
+for your log group, for example, the 'vpcflowlogs' in a log group: 'vpcflowlogs/vpc-123456789'.  This tool will download the last hour of relevant
+flowlogs for these IP addresses and check their status.  This may take several minutes depending on volume of traffic
+ 
+Arguments:
+  --accounts=<>         # Optional, a comma-separated list of accounts to run in by your CLI profile names. Checks AWS_PROFILE env. variable if not set
+  --sgs                 # optional flag, checks the ENIs for existence and SGs for rules, otherwise just evalutes the routing / subnets / NACLs
+  <source_ip>           # The origin IP of the traffic
+  <target>              # Either the IP or DNS name of the destination you are sending traffic to
+  --target_port=<>      # Optional, if you want to test a specific TCP port, otherwise will test for all ports
+  --flowlogs=<>         # Optional, specify prefix for CloudWatch Log Group Name that stores flowlogs.
+
+Examples:
+  $ ops network-map
+"""
+
+from docopt import docopt
+args = docopt(__doc__)
+
+import boto3
+import json
+import datetime
+import multiprocessing
+import os
+import timeit
+import random
+from netaddr import IPNetwork, IPAddress
+import socket
+import requests
+import dns.resolver
+
+if args['-h'] is True or args['--help'] is True:
+    print(__doc__)
+
+ABORT = False
+
+if args['--accounts']:
+    accounts = args['--accounts'].split(',')
+else:
+    if 'AWS_PROFILE' in os.environ:
+        accounts = os.environ['AWS_PROFILE'].split(',')
+    else:
+        print('You did not specify --accounts and also do not have AWS_PROFILE exported to environmental variables')
+        ABORT = True
+
+# Inherently multiregion, so just setting for the initial describe-region calls
+if 'AWS_REGION' in os.environ:
+    region = os.environ['AWS_REGION']
+else:
+    region = 'us-east-1'
+
+
+filename = 'results/network-map-' + datetime.date.today().isoformat() + '.txt'
+
+# Load the list of non-AWS networks (data centers, corporate networks, etc) from config.txt
+try: 
+    non_AWS_CIDRs = json.load(open('config.txt','r'))
+except Exception as e:
+    print(e)
+    non_AWS_CIDRs = {}
+
+all_vpcs = {}
+subnet_CIDRs = []
+
+private_ips = {'10.0.0.0/8','172.16.0.0/12','192.168.0.0/16'}
+
+def json_serial(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+
+def audit_parallel(fargs):
+    account = fargs[0]
+    region = fargs[1]
+
+    ec2 = boto3.session.Session(profile_name=account, region_name=region).client('ec2')
+    region_vpcs = {}
+    filters = {}
+    
+    try:
+        peers = ec2.describe_vpc_peering_connections()
+    except Exception as e:
+        print(e)
+
+    try:
+        vpcs = ec2.describe_vpcs(**filters)
+    except Exception as e:
+        print(e)
+    else:
+        # get elastic IPs: (this ignores non-elastic Public IPs that we don't really use)
+        try:
+            public_ips = ec2.describe_addresses()
+        except Exception as e:
+            print(e)
+
+        # get elbs, which you can't filter a specific VPC
+        local_elbs = get_elbs(account,region)
+
+        for vpc in vpcs['Vpcs']:
+            region_vpcs[vpc['VpcId']] = vpc
+            region_vpcs[vpc['VpcId']]['Peers'] = {}
+            for peer in peers['VpcPeeringConnections']:
+                if peer['AccepterVpcInfo']['VpcId'] == vpc['VpcId']:
+                    region_vpcs[vpc['VpcId']]['Peers'][peer['RequesterVpcInfo']['VpcId']] = {'status':peer['Status']['Code'], 'Id':peer['VpcPeeringConnectionId']}
+                elif peer['RequesterVpcInfo']['VpcId'] == vpc['VpcId']:
+                    region_vpcs[vpc['VpcId']]['Peers'][peer['AccepterVpcInfo']['VpcId']] = {'status':peer['Status']['Code'], 'Id':peer['VpcPeeringConnectionId']}
+
+            # capture the details of the ELBs that are in this VPC (they don't live in subnets)
+            region_vpcs[vpc['VpcId']]['elbs'] = {}
+            for elb in local_elbs:
+                if 'VpcId' in elb and elb['VpcId'] == vpc['VpcId']:
+                    region_vpcs[vpc['VpcId']]['elbs'][elb['DNSName']] = elb
+
+            try:
+                subnets = ec2.describe_subnets(
+                    Filters=[
+                        {
+                            'Name': 'vpc-id',
+                            'Values': [ vpc['VpcId'], ]
+                        },
+                    ],
+                )
+            except Exception as e:
+                print(e)
+            else:
+                region_vpcs[vpc['VpcId']]['Subnets'] = {}
+                for subnet in subnets['Subnets']:
+                    region_vpcs[vpc['VpcId']]['Subnets'][subnet['SubnetId']] = {}
+                    region_vpcs[vpc['VpcId']]['Subnets'][subnet['SubnetId']]['Details'] = subnet
+                    try:
+                        route_tables = ec2.describe_route_tables(
+                            Filters=[
+                                {
+                                    'Name': 'association.subnet-id',
+                                    'Values': [
+                                        subnet['SubnetId'],
+                                    ]
+                                },
+                            ],
+                        )
+                    except Exception as e:
+                        print(e)
+                    else:
+                        region_vpcs[vpc['VpcId']]['Subnets'][subnet['SubnetId']]['RouteTables'] = route_tables['RouteTables']
+                    try:
+                        nacls = ec2.describe_network_acls(
+                            Filters=[
+                                {
+                                    'Name': 'association.subnet-id',
+                                    'Values': [
+                                        subnet['SubnetId'],
+                                    ]
+                                },
+                            ]
+                        )
+                    except Exception as e:
+                        print(e)
+                    else:
+                        subnet_nacls = []
+                        for nacl in nacls['NetworkAcls']:
+                            for entry in nacl['Entries']:
+                                subnet_nacls.append(entry)
+                        region_vpcs[vpc['VpcId']]['Subnets'][subnet['SubnetId']]['NetworkAcls'] = subnet_nacls
+
+                    # see if any of the eIPs are in this subnet
+                    public_in_subnet = []
+                    for eip in public_ips['Addresses']:
+                        if 'PrivateIpAddress' in eip and IPAddress(eip['PrivateIpAddress']) in IPNetwork(subnet['CidrBlock']):
+                            public_in_subnet.append(eip['PublicIp']) #possibly include PrivateIpAddress as a dict if needed for SG lookup?
+                    region_vpcs[vpc['VpcId']]['Subnets'][subnet['SubnetId']]['PublicIPs'] = public_in_subnet
+
+    return {'account': account, 'region':region, 'vpcs':region_vpcs}
+
+def get_elbs(account,region):
+    ec2 = boto3.session.Session(profile_name=account, region_name=region).client('ec2')
+    elb = boto3.session.Session(profile_name=account, region_name=region).client('elb')
+    elbv2 = boto3.session.Session(profile_name=account, region_name=region).client('elbv2')
+    local_elbs = []
+    #v2 describe, application and network health
+    try:
+        paginatorv2 = elbv2.get_paginator('describe_load_balancers')
+    except Exception as e:
+        print(e)
+    else:
+        try:
+            responsesv2 = paginatorv2.paginate()
+        except Exception as e:
+            print(e)
+        else:
+            for page in responsesv2:
+                if 'LoadBalancers' in page:
+                    for an_elb in page['LoadBalancers']:
+                        # v2 doesn't include listener information in the describe_load_balancer call, so have to get:
+                        try:
+                            listeners = elbv2.describe_listeners(LoadBalancerArn=an_elb['LoadBalancerArn'])
+                        except Exception as e:
+                            print(e)
+                        else:
+                            an_elb['Listeners'] = listeners['Listeners']
+                        # v2 doesn't include target information in the describe_load_balancer call, so have to get it:
+                        try:
+                            targets = elbv2.describe_target_groups(LoadBalancerArn=an_elb['LoadBalancerArn'])
+                        except Exception as e:
+                            print(e)
+                        else:
+                            an_elb['Targets'] = targets['TargetGroups']
+                        local_elbs.append(an_elb)
+    #v1 describe, classic
+    try:
+        paginator = elb.get_paginator('describe_load_balancers')
+    except Exception as e:
+        print(e)
+    else:
+        try:
+            responses = paginator.paginate()
+        except Exception as e:
+            print(e)
+        else:
+            for page in responses:
+                if 'LoadBalancerDescriptions' in page:
+                    for an_elb in page['LoadBalancerDescriptions']:
+                        an_elb['VpcId'] = an_elb['VPCId'] # swap to match V2 key
+                        # get resolve targets to IP addresses
+                        elb_target_details = []
+                        for instance in an_elb['Instances']:
+                            try:
+                                instances = ec2.describe_instances(InstanceIds=[instance['InstanceId']])
+                            except Exception as e:
+                                print(e)
+                            else:
+                                elb_target_details.append(instances['Reservations'][0]['Instances'][0]['PrivateIpAddress'])
+                        an_elb['Targets'] = elb_target_details
+                        local_elbs.append(an_elb)
+    return local_elbs
+
+def build_subnet_CIDRs():
+    for account in all_vpcs:
+        for region in all_vpcs[account]:
+            for vpc in all_vpcs[account][region]:
+                for subnet in all_vpcs[account][region][vpc]['Subnets']:
+                    subnet_CIDRs.append(all_vpcs[account][region][vpc]['Subnets'][subnet]['Details']['CidrBlock'])
+
+def network_map():
+    network_map = {}
+    for account in all_vpcs:
+        network_map[account] = {}
+        for region in all_vpcs[account]:
+            network_map[account][region] = {}
+            for vpc in all_vpcs[account][region]:
+                network_map[account][region][vpc] = {}
+                for subnet in all_vpcs[account][region][vpc]['Subnets']:
+                    network_map[account][region][vpc][subnet] = {}
+                    network_map[account][region][vpc][subnet]['CidrBlock'] = all_vpcs[account][region][vpc]['Subnets'][subnet]['Details']['CidrBlock']
+                    local_connections = {}
+                    for routetable in all_vpcs[account][region][vpc]['Subnets'][subnet]['RouteTables']:
+                        local_routes = cleanup_route_tables(routetable)
+                        network_map[account][region][vpc][subnet]['default_route'] = local_routes[-1]
+                        for CIDR in non_AWS_CIDRs:
+                            for rule in local_routes:
+                                if IPNetwork(CIDR) in IPNetwork(rule['DestinationCidrBlock']):
+                                    local_connections[CIDR] = rule
+                                    break
+                        for CIDR in subnet_CIDRs:
+                            for rule in local_routes:
+                                if IPNetwork(CIDR) in IPNetwork(rule['DestinationCidrBlock']):
+                                    local_connections[CIDR] = rule
+                                    break
+                        # local_connections = sorted(local_connections, key=lambda x: (x['DestinationCidrBlock'].split('/')[1]), reverse=True)
+                    if local_connections:
+                        network_map[account][region][vpc][subnet]['Connections'] = local_connections
+    return network_map 
+
+def cleanup_route_tables(routetable):
+    local_routes = []
+    for rule in routetable['Routes']:
+        if 'DestinationCidrBlock' not in rule: #no IPv4 CIDR, ignoring this route rule
+            pass
+        else:
+            local_routes.append(rule)
+
+    # order the rules by least permissive to most because that's how router logic works
+    local_routes = sorted(local_routes, key=lambda x: (x['DestinationCidrBlock'].split('/')[1]), reverse=True)
+
+    # look for conflicts where there are two routes to an identical CIDR
+    for rule in local_routes:
+        for rule2 in local_routes:
+            if rule != rule2 and rule['DestinationCidrBlock'] == rule2['DestinationCidrBlock']:
+                # conflict found, resolution order: vpc peering, then static route, then vgw propogated, then ?
+                # Naively believed that an active route would take priority over a known black hole, but testing disproved this, so state doesn't matter
+
+                if 'VpcPeeringConnectionId' in rule and 'VpcPeeringConnectionId' not in rule2:
+                    #rule wins
+                    local_routes.remove(rule2)
+                elif 'VpcPeeringConnectionId' in rule2 and 'VpcPeeringConnectionId' not in rule:
+                    #rule2 wins
+                    local_routes.remove(rule)
+                # if neither are VPC peering, then you evaluate the origin of the rule.  Possible values 'CreateRouteTable'|'CreateRoute'|'EnableVgwRoutePropagation',
+                elif rule['Origin'] == 'CreateRoute' and rule2['Origin'] == 'EnableVgwRoutePropagation':
+                    # rule wins
+                    local_routes.remove(rule2)
+                elif rule2['Origin'] == 'CreateRoute' and rule['Origin'] == 'EnableVgwRoutePropagation':
+                    #rule2 wins
+                    local_routes.remove(rule)
+                else:
+                    print('unknown resolution for conflict for ' + rule['DestinationCidrBlock'] + ': ' + json.dumps(rule) + ', ' + json.dumps(rule2))
+    return local_routes
+
+def evaluate_NACL(nacls, ip, port, direction):
+    if direction == 'Egress':
+        EGRESS = True
+    elif direction == 'Ingress':
+        EGRESS = False
+    else:
+        return 'Error: direction must be either "Egress" or "Ingress"'
+
+    for nacl in nacls:
+        if nacl['Egress'] is EGRESS: # applies to direction of traffic
+            if IPAddress(ip) in IPNetwork(nacl['CidrBlock']): # this NACL applies to this particular target IP address
+                if port and 'PortRange' in nacl: # specific port specified in argument
+                    if int(port) >= nacl['PortRange']['From'] and int(port) <= nacl['PortRange']['To']: # this NACL applies to these ports
+                        if nacl['RuleAction'] == "deny":
+                            return {'ALLOW':False,'NACL':nacl}
+                        elif nacl['RuleAction'] == "allow":
+                            return {'ALLOW':True,'NACL':nacl}
+                elif nacl['Protocol'] == "-1": # applies to all traffic, which is what we assume to be testing if a port isn't specified
+                    if nacl['RuleAction'] == "deny":
+                        return {'ALLOW':False,'NACL':nacl}
+                    elif nacl['RuleAction'] == "allow":
+                        return {'ALLOW':True,'NACL':nacl}
+    return 'error: no NACL found that applies to this traffic'
+
+def get_sg_details(account,region,vpc,ip, scope):
+    sgs = []
+    sgs_names = []
+
+    if scope == 'public':
+        ip_filter = 'association.public-ip'
+    elif scope == 'private':
+        ip_filter = 'addresses.private-ip-address'
+    elif scope =='none':
+        return {'Details':sgs,'Names':sgs_names} # blank data structure for non-AWS IPs that won't have SGs
+    else:
+        print('error: you didnt specify if this was a public or private IP')
+
+    ec2 = boto3.session.Session(profile_name=account, region_name=region).client('ec2')
+    try:
+        enis = ec2.describe_network_interfaces(Filters=[
+            {
+                'Name':'vpc-id',
+                'Values': [vpc]
+            },
+            {
+                'Name':ip_filter,
+                'Values': [ip]
+            }
+        ])
+    except Exception as e:
+        print(e)
+    else:
+        if not enis['NetworkInterfaces']:
+            return {'ALLOW':False, 'eni':'', 'error':'No ENI found that corresponds to this IP address, so cannot evaluate SGs, and this is an invalid traffic target'}
+        elif len(enis['NetworkInterfaces']) > 1:
+            return {'ALLOW':False, 'eni':'', 'error':'more than one ENI resolved to this IP address: ' + json.dumps(enis['NetworkInterfaces'],indent=4,default=json_serial)}
+        else:
+            eni = enis['NetworkInterfaces'][0] #for eni in enis['NetworkInterfaces']:
+            if not eni['Groups']:
+                return {'ALLOW':False, 'error':'No SGs attached to this ENI, so no traffic can reach it'}
+            else:
+                for sg in eni['Groups']:
+                    try:
+                        sg_details = ec2.describe_security_groups(GroupIds=[sg['GroupId']])
+                    except Exception as e:
+                        print(e)
+                    else:
+                        sgs.append(sg_details['SecurityGroups'][0])
+                        sgs_names.append(sg_details['SecurityGroups'][0]['GroupId'])
+    return {'Details':sgs,'Names':sgs_names,'eni':eni['NetworkInterfaceId']} #idk if the target will be in this account/region/vpc so really hard to check membership
+
+def evaluate_sgs(ip, port, direction, my_sgs, other_sgs):
+    # SGs are stateful and allow-only, so finding any rule that matches the port and includes the IP is sufficient for both outbound and return
+    if direction == 'Egress':
+        rules_to_check = 'IpPermissionsEgress'
+    elif direction == 'Ingress':
+        rules_to_check = 'IpPermissions'
+    
+    for sg in my_sgs['Details']:
+        if rules_to_check in sg:
+            for rule in sg[rules_to_check]:
+                if rule['IpProtocol'] == '-1': # applies to all traffic, which is what we assume to be testing if a port isn't specified
+                    for iprange in rule['IpRanges']:
+                        if IPAddress(ip) in IPNetwork(iprange['CidrIp']): # this SG applies to this particular target IP address
+                            return {'ALLOW':True,'sg':sg['GroupId'],'rule':rule}
+                        for sg_membership in rule['UserIdGroupPairs']: # this rule applies to instances within a specific SG
+                            if sg_membership['GroupId'] in other_sgs['Names']: # check if the target is in the specified SG
+                                return {'ALLOW':True,'sg':sg['GroupId'],'rule':rule}
+                elif port: # specific port to check selected by user, otherwise check all
+                    if int(port) >= rule['FromPort'] and int(port) <= rule['ToPort']: # this this SG applies to specified port
+                        for iprange in rule['IpRanges']:
+                            if IPAddress(ip) in IPNetwork(iprange['CidrIp']): # this SG applies to this particular target IP address
+                                return {'ALLOW':True,'sg':sg['GroupId'],'rule':rule}
+                        for sg_membership in rule['UserIdGroupPairs']: # this rule applies to instances within a specific SG
+                            if sg_membership['GroupId'] in other_sgs['Names']: # check if the target is in the specified SG
+                                return {'ALLOW':True,'sg':sg['GroupId'],'rule':rule}
+    return {'ALLOW':False, 'error':'No rule found in attached SGs allowing this traffic, please add a rule to one of the SGs: ' + json.dumps(my_sgs['Names'])}
+
+def find_route(account,region,vpc,subnet,target_ip):
+    if 'Connections' in network_map[account][region][vpc][subnet]:
+        for connection in network_map[account][region][vpc][subnet]['Connections']:
+            if IPAddress(target_ip) in IPNetwork(connection):
+                if network_map[account][region][vpc][subnet]['Connections'][connection]['State'] != 'active':
+                    print('ERROR: this route is defined but is not active')
+                return {'route':network_map[account][region][vpc][subnet]['Connections'][connection],'default':False}
+    # no route specified for any CIDR this rolls up to, must use default route
+    return {'route':network_map[account][region][vpc][subnet]['default_route'],'default':True}
+
+def trace_source(source_ip, source_path, source_port, target_ip, target_port, source_sgs, target_sgs):
+    # outbound from source:
+    print('\n'+source_ip + ' is in ' + source_path['account'] + ' ' + source_path['region'] + ' ' + source_path['vpc'] + ' ' + source_path['subnet'])
+    print('Evaluating traffic outbound from source:')
+    
+    # route to target
+    source_route = find_route(source_path['account'],source_path['region'],source_path['vpc'],source_path['subnet'],target_ip)
+    print('\tRoute to target: ' + json.dumps(source_route))
+    if source_route['default']:
+        print('WARNING: This uses the default route, and likely will work')
+    
+    # NACLs egress rules on source subnet
+    source_nacls = all_vpcs[source_path['account']][source_path['region']][source_path['vpc']]['Subnets'][source_path['subnet']]['NetworkAcls']
+    source_nacl_egress = evaluate_NACL(source_nacls,target_ip, target_port,'Egress')
+    print('\tNACL allows traffic: ' + str(source_nacl_egress['ALLOW']) + ', ' + json.dumps(source_nacl_egress['NACL']))
+    
+    # SGs egress rules on source ENI
+    if args['--sgs'] is True:
+        sg_evaluation = evaluate_sgs(target_ip,target_port, 'Egress', source_sgs, target_sgs)
+        if sg_evaluation['ALLOW'] is True:
+            print('\tSecurity groups allow traffic: ' + sg_evaluation['sg'] + ', rule ' + json.dumps(sg_evaluation['rule']))
+        else:
+            print('\tERROR: ' + sg_evaluation['error'])
+    else:
+        sg_evaluation = {'ALLOW':True}
+
+    print('Evaluating return traffic inbound to source')
+    # SGs don't matter for return traffic because they're stateful
+    source_nacl_ingress = evaluate_NACL(source_nacls,target_ip, source_port,'Ingress')
+    print(str('\tNACL allows traffic: ' + str(source_nacl_ingress['ALLOW']) + ', ' + json.dumps(source_nacl_ingress['NACL'])))
+
+    if args['--flowlogs'] is True:
+        print('Evaluating flowlogs of source:')
+        check_flowlogs([source_path['account'],source_path['region'],source_path['vpc'], source_sgs['eni'], source_ip, target_ip, target_port])
+
+    if not source_route['default'] and source_nacl_egress['ALLOW'] and source_nacl_ingress['ALLOW'] and sg_evaluation['ALLOW']:
+        return {'source_route':source_route,'valid':True}
+    else:
+        return {'source_route':source_route,'valid':False}
+
+def trace_target(target_ip, target_path, target_port, source_ip, source_port, source_sgs, target_sgs):
+    print('\n'+target_ip + ' is in ' + target_path['account'] + ' ' + target_path['region'] + ' ' + target_path['vpc'] + ' ' + target_path['subnet'])
+    
+    # inbound to target
+    print('Evaluating traffic inbound to target')
+    # NACLs ingress on target subnet
+    target_nacls = all_vpcs[target_path['account']][target_path['region']][target_path['vpc']]['Subnets'][target_path['subnet']]['NetworkAcls']
+    target_nacl_ingress = evaluate_NACL(target_nacls,source_ip,target_port,'Ingress')
+    print('\tNACL allows traffic: ' + str(target_nacl_ingress['ALLOW']) + ', ' + json.dumps(target_nacl_ingress['NACL']))
+
+    # SGs ingress on target ENI
+    if args['--sgs'] is True:
+        sg_results = evaluate_sgs(source_ip, target_port, 'Ingress', target_sgs, source_sgs)
+        if sg_results['ALLOW'] is True:
+            print('\tSecurity groups allow traffic: ' + sg_results['sg'] + ', rule ' + json.dumps(sg_results['rule']))
+        else:
+            print('\tERROR: ' + sg_results['error'])
+    else:
+        sg_results = {'ALLOW':True}
+    
+    # return traffic outbound from target
+    print('Evaluating return traffic outbound from target: ')
+
+    # route to source
+    target_route = find_route(target_path['account'],target_path['region'],target_path['vpc'],target_path['subnet'],source_ip)
+    print('\tRoute to source: ' + json.dumps(target_route))
+    if target_route['default']:
+        print('WARNING: This uses the default route, and likely will not work')
+    
+    # NACLs egress rules on target subnet
+    target_nacl_egress = evaluate_NACL(target_nacls,source_ip,source_port,'Egress')
+    print('\tNACL allows traffic: ' + str(target_nacl_egress['ALLOW']) + ':, ' + json.dumps(target_nacl_egress['NACL']))
+
+    if args['--flowlogs'] is True:
+        print('Evaluating flowlogs of target:')
+        check_flowlogs([target_path['account'],target_path['region'],target_path['vpc'], target_sgs['eni'], source_ip, target_ip, target_port])
+
+
+    if not target_route['default'] and target_nacl_egress['ALLOW'] and target_nacl_ingress['ALLOW'] and sg_results['ALLOW']:
+        return {'target_route':target_route,'valid':True}
+    else:
+        return {'target_route':target_route,'valid':False}
+
+def check_ip_for_public(ip):
+    for CIDR in private_ips:
+        if IPAddress(ip) in IPNetwork(CIDR):
+            return False
+    return True
+
+def trace_public_inbound(account,region,vpc,subnet,target_details,target_port,source_ip,source_port,source_sgs,target_sgs):
+    # Steps for traffic inbound from Internet:
+    # A) determine source is from the internet
+    # B) resolve DNS**
+    # C) determine that an IGW exists in the VPC
+    # D) see if it's a public IP (either eIP or just public)
+
+    # if public IP:
+    # E) check SG to accept Internet traffic (handles response too)
+    # F) check route for default traffic points to IGW
+    # G) check NACLs to accept Internet traffic
+    # H) check NACLs for response traffic
+
+    # if ELB:
+    # E) check that a LB existing that is point at this IP and accepting traffic from the internet
+    # F) check that the subnets between the LB and private IP NACLs 
+    # G) check SGs on the private IP
+    # H) check NACLS on any hops
+
+    target_ip = target_details['ip']
+
+    print('\n'+target_ip + ' is in ' + account + ' ' + region + ' ' + vpc + ' ' + subnet)
+
+    print('Evaluating inbound traffic to target from the internet')
+
+    ec2 = boto3.session.Session(profile_name=account, region_name=region).client('ec2')
+    try:
+        igw =ec2.describe_internet_gateways(Filters=[
+            {
+                'Name': 'attachment.vpc-id',
+                'Values': [vpc,]
+            },
+            {
+                'Name': 'attachment.state',
+                'Values': ['available',]
+            },        
+        ])
+    except Exception as e:
+        print(e)
+    else:
+        if not igw['InternetGateways']:
+            print('ERROR: No internet gateway is attached to and available in this vpc, so Internet traffic will not work')
+
+    # C & D - check for public IP and SG allowing ingress traffic
+    if args['--sgs'] is True:
+        sg_results = evaluate_sgs(target_ip, target_port, 'Ingress', target_sgs, source_sgs)
+        if sg_results['ALLOW'] is True:
+            print('\tSecurity groups allow traffic from internet: ' + sg_results['sg'] + ', rule ' + json.dumps(sg_results['rule']))
+        else:
+            print('\tERROR: ' + sg_results['error'])
+    else:
+        sg_results = {'ALLOW':True}
+
+    # F & G - check NACLs
+    target_nacls = all_vpcs[account][region][vpc]['Subnets'][subnet]['NetworkAcls']
+
+    target_nacl_ingress = evaluate_NACL(target_nacls,source_ip,target_port,'Ingress')
+    print(str('\tNACL allows inbound traffic from internet: ' + str(target_nacl_ingress['ALLOW']) + ', ' + json.dumps(target_nacl_ingress['NACL'])))
+
+    target_nacl_egress = evaluate_NACL(target_nacls,source_ip, 35623,'Egress')
+    print('\tNACL allows response traffic to internet: ' + str(target_nacl_egress['ALLOW']) + ', ' + json.dumps(target_nacl_egress['NACL']))
+
+
+    if args['--flowlogs'] is True:
+        print('Evaluating flowlogs of target:')
+        check_flowlogs([account,region,vpc, target_sgs['eni'], source_ip, target_ip, target_port])
+
+
+    # E check route for response traffic to internet, should point to IGW
+    target_route = find_route(account,region,vpc,subnet,source_ip)
+    print('\tRoute to source for response traffic: ' + json.dumps(target_route))
+    if 'GatewayId' not in target_route['route'] or target_route['route']['GatewayId'] != igw['InternetGateways'][0]['InternetGatewayId']:
+        print('ERROR: response traffic does not point to this VPCs IGW')
+    else:
+        if target_route['default'] and target_nacl_ingress['ALLOW'] and target_nacl_egress['ALLOW'] and sg_results['ALLOW']:
+            print('\nConclusion: AWS Configurations for the target look good, traffic should be flowing from the internet')
+    if 'elbs' in target_details: # target was an ELB, need to evaluate next hop to targets
+        unique_elbs = list(set(target_details['elbs']))
+
+        # get private IP address of internet-facing public ELB, which you need for routing to resolve correctly:
+        try:
+            enis = ec2.describe_network_interfaces(Filters=[
+                {
+                    'Name':'vpc-id',
+                    'Values': [vpc]
+                },
+                {
+                    'Name':'association.public-ip',
+                    'Values': [target_ip]
+                }
+            ])
+        except Exception as e:
+            print(e)
+        else:
+            elb_private_ip = enis['NetworkInterfaces'][0]['PrivateIpAddress']
+        for elb_dns in unique_elbs:
+            if elb_dns in all_vpcs[account][region][vpc]['elbs']:
+                elb_details = all_vpcs[account][region][vpc]['elbs'][elb_dns]
+                print('Target is an internet-facing ELB, so resolving it to its private IP: ' + elb_private_ip + ' and tracing the network configurations to each of the instances it could be passing traffic to: ' + json.dumps(elb_details['Targets']))
+                for next_hop in elb_details['Targets']:
+                    print('\nEvaluating ELB to ' + next_hop)
+
+                    elb_path = {'account':account,'region':region,'vpc':vpc,'subnet':subnet}
+                    next_hop_path = find_ip_in_network(next_hop,'private')
+                    next_hop_sgs = get_sg_details(next_hop_path['account'],next_hop_path['region'],next_hop_path['vpc'],next_hop, 'private')
+
+                    source = trace_source(elb_private_ip, elb_path, source_port, next_hop, target_port, target_sgs, next_hop_sgs)
+                    target = trace_target(next_hop, next_hop_path, target_port, elb_private_ip, source_port, target_sgs, next_hop_sgs)
+                    
+                    # if route existings on both side and matches, and all 4 NACLs are allow, and both SGs are allow, traffic should be flowing unless there is a MITM router/firewall
+                    if source['valid'] and target['valid']:
+                        print('\nConclusion: AWS Configurations for both source and target look good, traffic should be flowing')
+                    else:
+                        print('\nConclusion: There is an error preventing traffic from flowing between these two IPs')
+
+def trace_public_outbound(account,region,vpc,subnet,source_ip,target_ip,target_port, source_sgs, target_sgs):
+    # Steps for traffic outbound to Internet
+    # A) Check that an IGW exists
+    # B) Check that default route points to IGW or NAT
+    # C) Check SGs to allow outbound traffic to internet
+    # D) If NAT, check NACLs for:
+    #       Traffic from current subnet to NAT subnet and back
+    #       Traffic from NAT subnet to internet
+    #       Route from NAT points to IGW
+    # E) If IGW, check:
+    #       instance has a public IP
+    #       NACLs allow traffic and response from internet
+
+    print('\n'+source_ip + ' is in ' + account + ' ' + region + ' ' + vpc + ' ' + subnet)
+
+    print('Evaluating outbound traffic to internet from the source')
+
+    ec2 = boto3.session.Session(profile_name=account, region_name=region).client('ec2')
+    try:
+        igw =ec2.describe_internet_gateways(Filters=[
+            {
+                'Name': 'attachment.vpc-id',
+                'Values': [vpc,]
+            },
+            {
+                'Name': 'attachment.state',
+                'Values': ['available',]
+            },        
+        ])
+    except Exception as e:
+        print(e)
+    else:
+        if not igw['InternetGateways']:
+            print('ERROR: No internet gateway is attached to and available in this vpc, so Internet traffic will not work')
+
+    # C & D - check for public IP and SG allowing ingress traffic
+    if args['--sgs'] is True:
+        sg_results = evaluate_sgs(target_ip, target_port, 'Egress', source_sgs, target_sgs)
+        if sg_results['ALLOW'] is True:
+            print('\tSecurity groups allow traffic to internet: ' + sg_results['sg'] + ', rule ' + json.dumps(sg_results['rule']))
+        else:
+            print('\tERROR: ' + sg_results['error'])
+    else:
+        sg_results = {'ALLOW':True}
+
+    source_public = check_ip_for_public(source_ip)
+                
+    # F & G - check NACLs   
+    target_nacls = all_vpcs[account][region][vpc]['Subnets'][subnet]['NetworkAcls']
+    # NACLs egress rules on source subnet
+    target_nacl_egress = evaluate_NACL(target_nacls,target_ip, target_port,'Egress')
+    print('\tNACL allows outbound traffic from source: ' + str(target_nacl_egress['ALLOW']) + ', ' + json.dumps(target_nacl_egress['NACL']))
+
+    target_nacl_ingress = evaluate_NACL(target_nacls,source_ip, 32642, 'Ingress')
+    print(str('\tNACL allows inbound response traffic to source: ' + str(target_nacl_ingress['ALLOW']) + ', ' + json.dumps(target_nacl_ingress['NACL'])))
+      
+    # E check route for response traffic to internet, should point to IGW or NAT
+    target_route = find_route(account,region,vpc,subnet,target_ip)
+    if 'GatewayId' in target_route['route']: # points to IGW
+        if target_route['route']['GatewayId'] == igw['InternetGateways'][0]['InternetGatewayId']:
+            if source_public:
+                print('\tRoute outbound to internet points to IGW and source IP is public: ' + json.dumps(target_route))
+                if target_route['default'] and target_nacl_ingress['ALLOW'] and target_nacl_egress['ALLOW'] and sg_results['ALLOW']:
+                    print('\nConclusion: AWS Configurations for source look good, traffic should be flowing to the internet')
+            else:
+                print('\tERROR: Route outbound to internet points to an IGW, but the source IP is not public so it will fail: ' + json.dumps(target_route))
+                print('\nConclusion: An error above is preventing outbound traffic from this source to the internet')
+    elif 'NatGatewayId' in target_route['route']: # points to NAT
+        try:
+            nat_details = ec2.describe_nat_gateways(NatGatewayIds=[target_route['route']['NatGatewayId']])['NatGateways'][0]
+        except Exception as e:
+            print(e)
+        else:
+            if nat_details['State'] != 'available':
+                print('ERROR: NAT Gateway is not available, state: ' + nat_details['State'])
+                print('\nConclusion: An error above is preventing outbound traffic from this source to the internet')
+            else:
+                print('\tRoute outbound to internet points to a NAT Gateway: ' + json.dumps(target_route))
+                print('\n\tEvaluate NACLs for NAT subnet: ')
+                # Extend NACL evaluate to the NAT NACLs
+                nat_nacls = all_vpcs[account][region][vpc]['Subnets'][nat_details['SubnetId']]['NetworkAcls']
+                
+                # Evaluate NAT NACLs from source <> NAT
+                nat_nacl_ingress_private = evaluate_NACL(nat_nacls,source_ip, target_port,'Ingress')
+                print('\tNAT NACL allows inbound traffic from source: ' + str(nat_nacl_ingress_private['ALLOW']) + ', ' + json.dumps(nat_nacl_ingress_private['NACL']))
+                
+                nat_nacl_egress_private = evaluate_NACL(nat_nacls,source_ip,32642,'Egress')
+                print('\tNAT NACL allows response traffic to source: ' + str(nat_nacl_egress_private['ALLOW']) + ', ' + json.dumps(nat_nacl_egress_private['NACL']))
+
+                # Evaluate NACLs for NAT <> Internet
+                nat_nacl_egress_public = evaluate_NACL(nat_nacls,target_ip,target_port,'Egress') 
+                print('\tNAT NACL allows outbound traffic to internet: ' + str(nat_nacl_egress_public['ALLOW']) + ', ' + json.dumps(nat_nacl_egress_public['NACL']))
+
+                nat_nacl_ingress_public = evaluate_NACL(nat_nacls,target_ip,32642,'Ingress')
+                print('\tNAT NACL allows inbound response traffic from internet: ' + str(nat_nacl_ingress_public['ALLOW']) + ', ' + json.dumps(nat_nacl_ingress_public['NACL']))
+
+                # Route from NAT to IGW?
+                nat_route = find_route(account,region,vpc,nat_details['SubnetId'],target_ip)
+                if nat_route['route']['GatewayId'] == igw['InternetGateways'][0]['InternetGatewayId']:
+                    print('\tRoute outbound to internet points to IGW and source IP is public: ' + json.dumps(nat_route))
+                
+                if target_route['default'] and target_nacl_ingress['ALLOW'] and target_nacl_egress['ALLOW'] and sg_results['ALLOW'] and nat_nacl_ingress_private['ALLOW'] and nat_nacl_egress_private['ALLOW'] and nat_nacl_egress_public['ALLOW'] and nat_nacl_ingress_public['ALLOW'] and nat_route['default']:
+                    print('\nConclusion: AWS Configurations for source look good, traffic should be flowing to the internet')
+
+def resolve_target(target, scope):
+    # determine whether the target is DNS or IP, resolve it to IP
+    elbs = []
+    try:
+        socket.inet_aton(target)
+    except Exception as e: # not an IP address, so assuming DNS name
+        resolver = dns.resolver.Resolver()
+        if scope == 'public':
+            resolver.nameservers = ['8.8.8.8'] # only need an external nameserver if the source is public
+        dns_response = str(resolver.query(target).response).split(';')
+        dns_answers = dns_response[2].split('\n')
+        for answer in dns_answers:
+            alias = answer.split(' ')[0]
+            if 'elb.amazonaws' in alias:
+                elbs.append(alias[:-1])
+        
+        for answer in dns_answers:
+            if answer != 'ANSWER' and 'CNAME' not in answer:
+                resolved_ip = answer.split(' ')[-1]
+                break
+
+        print('Resolved DNS name ' +target + ' to IP: ' + resolved_ip)
+        if elbs:
+            return {'ip':resolved_ip,'elbs':elbs}
+        else:
+            return {'ip':resolved_ip}
+    else:
+        try:
+            dns_details = socket.gethostbyaddr(target) # returns (hostname, aliaslist, ipaddrlist)
+        except Exception as e:
+            print(e)
+        else:
+            for alias in dns_details[1]:
+                if 'elb.amazonaws' in alias:
+                    elbs.append(alias)
+            if elbs:
+                return {'ip':target,'elbs':elbs}
+            else:
+                return {'ip':target}
+
+def find_ip_in_network(ip,scope):
+    for account in all_vpcs:
+        for region in all_vpcs[account]:
+            for vpc in all_vpcs[account][region]:
+                for subnet in all_vpcs[account][region][vpc]['Subnets']:
+                    if scope == 'private':
+                        if IPAddress(ip) in IPNetwork(all_vpcs[account][region][vpc]['Subnets'][subnet]['Details']['CidrBlock']):
+                            return {'account':account,'region':region,'vpc':vpc,'subnet':subnet}
+                    elif scope == 'public_ip':
+                        for eip in all_vpcs[account][region][vpc]['Subnets'][subnet]['PublicIPs']:
+                            if eip == ip:
+                                return {'account':account,'region':region,'vpc':vpc,'subnet':subnet}
+                    elif scope == 'public_elb':
+                        if ip in all_vpcs[account][region][vpc]['elbs']:
+                            # print(json.dumps(all_vpcs[account][region][vpc]['elbs'][ip],indent=4,default=json_serial))
+                            return {'account':account,'region':region,'vpc':vpc,'subnet':all_vpcs[account][region][vpc]['elbs'][ip]['Subnets'][0]}
+    if scope == "private":
+        for private_network_CIDR in non_AWS_CIDRs:
+            if IPAddress(ip) in IPNetwork(private_network_CIDR):
+                print(ip + ' is located in ' + non_AWS_CIDRs[private_network_CIDR])
+                return {}
+        print('Error: ' + ip + ' is private but not found in this list of AWS accounts and non-AWS networks')
+    return {}
+
+def check_flowlogs(args):
+    account = args[0]
+    region = args[1]
+    vpc = args[2]
+    eni = args[3]
+    source_ip = args[4]
+    target_ip = args[5]
+    target_port = args[6]
+
+    log_group_name = args['--flowlogs']+'/'+vpc
+    flowlog_filename = 'results/' + vpc + '_' + eni + '_flowlogs.txt'
+    flowlogs_file = open(flowlog_filename, 'a')    
+
+    start = int((datetime.datetime.now() - datetime.timedelta(hours=1)).strftime("%s"))
+    cw = boto3.session.Session(profile_name=account, region_name=region).client('logs')
+
+    logcount = 0
+    try:
+        log_group = cw.describe_log_groups(logGroupNamePrefix=log_group_name)
+    except Exception as e:
+        print(e)
+    else:
+        try:
+            log_streams = cw.describe_log_streams(
+                logGroupName=log_group_name,
+                logStreamNamePrefix=eni
+            )
+        except Exception as e:
+            print(e)
+        else:
+            for stream in log_streams['logStreams']:
+                try:
+                    flowlogs = cw.get_log_events(
+                        logGroupName=log_group_name,
+                        logStreamName=stream['logStreamName'],
+                        startTime=start, # The start of the time range, expressed as the number of milliseconds after Jan 1, 1970 00:00:00 UTC. Events with a time stamp earlier than this time are not included.
+                        startFromHead=True,
+                    )
+                except Exception as e:
+                    print(e)
+                else:
+                    while flowlogs['events']: # No paginator for get_log_events so have to roll my own
+                        for log in flowlogs['events']:
+                            flowlogs_file.write(log['message'] + '\n')
+                            logcount += 1
+                        try:
+                            flowlogs = cw.get_log_events( 
+                                logGroupName=log_group_name,
+                                logStreamName=stream['logStreamName'],
+                                startTime=start, # The start of the time range, expressed as the number of milliseconds after Jan 1, 1970 00:00:00 UTC. Events with a time stamp earlier than this time are not included.
+                                startFromHead=True,
+                                nextToken=flowlogs['nextForwardToken'],
+                            )
+                        except Exception as e:
+                            print(e)
+                            break
+    if logcount > 0:
+        relevant_logs = 0
+        ALL_ACCEPTED = True
+        try:
+            results_file = open(flowlog_filename, 'r')
+        except Exception as e:
+            print(e)
+        else:
+            for event in results_file:
+                if source_ip in event and target_ip in event:
+                    log = event.split()
+                    if not target_port or target_port == log[5] or target_port == log[6]:
+                        relevant_logs += 1 
+                        if log[12] == 'REJECT':
+                            ALL_ACCEPTED = False
+                            print('\tFlowlogs indicate some traffic is being rejected: ' + json.dumps(log))
+            if relevant_logs == 0:
+                print('\tThere are no flowlogs indicating traffic between this source and target')
+            else:
+                if ALL_ACCEPTED is True:
+                    print('\tFlowlogs indicate that all traffic between source and target is being accepted for ' + str(relevant_logs) + ' events.')
+    # version[0] account-id[1] interface-id[2] srcaddr[3] dstaddr[4] srcport[5] dstport[6] protocol[7] packets[8] bytes[9] start[10] end[11] action[12] log-status[13]
+    flowlogs_file.close()
+    return
+
+def trace():
+    source_ip = args['<source_ip>']
+    source_public = check_ip_for_public(source_ip)
+
+    if source_public:
+        target_details = resolve_target(args['<target>'],'public')
+    else:
+        target_details = resolve_target(args['<target>'],'private')
+    target_ip = target_details['ip']
+
+    if source_ip and target_ip:
+        if args['--target_port']:
+            target_port = args['--target_port']
+        else:
+            target_port = None
+
+        source_port = random.randint(1024,65535)
+            
+        # resolve IPs to account/region/vpc/subnet, if they are in targeted accounts
+        target_public = check_ip_for_public(target_ip)
+        
+        if source_public:
+            source_path = find_ip_in_network(source_ip,'public_ip')
+            if source_path:
+                source_sgs = get_sg_details(source_path['account'],source_path['region'],source_path['vpc'],source_ip, 'public')
+            else:
+                source_sgs = get_sg_details('','','','','none')
+        else:
+            source_path = find_ip_in_network(source_ip,'private')
+            if source_path:
+                source_sgs = get_sg_details(source_path['account'],source_path['region'],source_path['vpc'],source_ip, 'private')
+            else:
+                source_sgs = get_sg_details('','','','','none')
+
+
+        if target_public:
+            if 'elbs' in target_details:
+                target_path = find_ip_in_network(target_details['elbs'][0],'public_elb')
+            else:
+                target_path = find_ip_in_network(target_ip,'public_ip')
+            if target_path:
+                target_sgs = get_sg_details(target_path['account'],target_path['region'],target_path['vpc'],target_ip, 'public')
+                # print(json.dumps(target_sgs))
+            else:
+                target_sgs = get_sg_details('','','','','none')
+        else:
+            target_path = find_ip_in_network(target_ip,'private')
+            if target_path:
+                target_sgs = get_sg_details(target_path['account'],target_path['region'],target_path['vpc'],target_ip, 'private')
+
+        if not target_public and not source_public: # both IPs correspond to private IPs
+            if target_path and source_path:  # both IPs correspond to subnets in this set of AWS accounts
+                source = trace_source(source_ip, source_path, source_port, target_ip, target_port, source_sgs, target_sgs)
+                target = trace_target(target_ip, target_path, target_port, source_ip, source_port, source_sgs, target_sgs)
+
+                # check for asymmetric routing without triggering dictionary issues
+                if 'VpcPeeringConnectionId' in source['source_route']['route']:
+                    if 'VpcPeeringConnectionId' in target['target_route']['route']:
+                        if source['source_route']['route']['VpcPeeringConnectionId'] != target['target_route']['route']['VpcPeeringConnectionId']:
+                            print('WARNING: Asymmetric routing')
+                    else:
+                        print('WARNING: Asymmetric routing')
+                elif 'NatGatewayId' in source['source_route']['route']:
+                    if 'NatGatewayId' not in target['target_route']['route']:
+                        print('WARNING: Asymmetric routing')
+                elif 'GatewayId' in source['source_route']['route']:
+                    if 'GatewayId' not in target['target_route']['route']:
+                        print('WARNING: Asymmetric routing')
+                elif 'NetworkInterfaceId' in source['source_route']['route']:
+                    if 'NetworkInterfaceId' not in target['target_route']['route']:
+                        print('WARNING: Asymmetric routing')
+                else:
+                    print('error')
+
+                # if route existings on both side and matches, and all 4 NACLs are allow, and both SGs are allow, traffic should be flowing unless there is a MITM router/firewall
+                if source['valid'] and target['valid']:
+                    print('\nConclusion: AWS Configurations for both source and target look good, traffic should be flowing')
+                else:
+                    print('\nConclusion: There is an error preventing traffic from flowing between these two IPs')
+
+                if 'elbs' in target_details:
+                    unique_elbs = list(set(target_details['elbs']))
+                    for elb_dns in unique_elbs:
+                        if elb_dns in all_vpcs[target_path['account']][target_path['region']][target_path['vpc']]['elbs']:
+                            elb_details = all_vpcs[target_path['account']][target_path['region']][target_path['vpc']]['elbs'][elb_dns]
+                            print('\nTarget is an ELB, so tracing the network configurations to each of the instances it could be passing traffic to: ' + json.dumps(elb_details['Targets']))
+                            for next_hop in elb_details['Targets']:
+                                print('\n\nEvaluating ELB to ' + next_hop)
+
+                                next_hop_path = find_ip_in_network(next_hop,'private')
+                                next_hop_sgs = get_sg_details(next_hop_path['account'],next_hop_path['region'],next_hop_path['vpc'],next_hop, 'private')
+
+                                # new source is previous target, don;t know how ports switch, need to look at flowlogs probably
+                                source = trace_source(target_ip, target_path, source_port, next_hop, target_port, target_sgs, next_hop_sgs)
+                                target = trace_target(next_hop, next_hop_path, target_port, target_ip, source_port, target_sgs, next_hop_sgs)
+                                
+                                # if route existings on both side and matches, and all 4 NACLs are allow, and both SGs are allow, traffic should be flowing unless there is a MITM router/firewall
+                                if source['valid'] and target['valid']:
+                                    print('\nConclusion: AWS Configurations for both source and target look good, traffic should be flowing')
+                                else:
+                                    print('\nConclusion: There is an error preventing traffic from flowing between these two IPs')
+            elif source_path: # only source_ip resolved to a valid IP in our AWS space, so tracing source side configurations:
+                source = trace_source(source_ip, source_path, source_port, target_ip, target_port, source_sgs, target_sgs)
+                if source['valid']:
+                    print('\nConclusion: AWS configurations for source side look good')
+            elif target_path: # only target resolved to a valid IP in our AWS space, so tracing target side configurations:
+                target = trace_target(target_ip, target_path, target_port, source_ip, source_port, source_sgs, target_sgs)
+                if target['valid']:
+                    print('\nConclusion: AWS configurations for target side look good')
+        # one or both of the IPs is public
+        elif target_public and source_path: # outbound internet traffic from private source IP to public target IP
+            trace_public_outbound(source_path['account'],source_path['region'],source_path['vpc'],source_path['subnet'],source_ip,target_ip,target_port, source_sgs, target_sgs)
+        elif source_public and target_path: # inbound internet traffic to target IP
+            trace_public_inbound(target_path['account'],target_path['region'],target_path['vpc'],target_path['subnet'],target_details,target_port, source_ip, source_port, source_sgs, target_sgs)
+        elif target_public and source_public and not target_path and not source_path:
+            print('Both IPs are public, but there is no record of ownership in the included accounts')
+
+if ABORT is False:
+    audit_timer = timeit.default_timer()
+    regions = boto3.session.Session(profile_name=accounts[0]).client('ec2').describe_regions()
+    regions_to_analyze = []
+    for region in regions['Regions']:
+        for account in accounts:
+            regions_to_analyze.append([account, region['RegionName']])
+    
+    pool = multiprocessing.Pool()
+    for account in accounts:
+        all_vpcs[account] = {}
+
+    responses = pool.map(audit_parallel, regions_to_analyze)
+    for response in responses:
+        all_vpcs[response['account']][response['region']] = response['vpcs']
+
+    build_subnet_CIDRs()
+    network_map = network_map()
+
+    if args['trace'] is True:
+        trace()
+
+    output_file = open(filename, 'w')
+    output_file.write(json.dumps(network_map,default=json_serial,indent=4, separators=(',', ': ')))
