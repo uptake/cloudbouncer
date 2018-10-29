@@ -1,13 +1,24 @@
 {
     "Variables": {
-        "SLACK_WEBHOOK": "https://hooks.slack.com/services/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",
-        "S3_INVENTORY_BUCKET_PREFIX": "uptake-s3inventory",
+        "SLACK_WEBHOOK": null,
+        "S3_INVENTORY_BUCKET_PREFIX": null,
         "S3_INVENTORY_FORMAT": "CSV",
         "S3_INVENTORY_VERSIONING": "Current",
-        "S3_INVENTORY_ACCOUNT": "647720091822",
-        "SLACK_CHANNEL": "#securecloud-alerts",
-        "S3_INVENTORY_RULE_NAME": "uptake-security-audit",
-        "DEFAULT_ENCRYPTION_KMS": "string",
+        "S3_INVENTORY_ACCOUNT": null,
+        "SLACK_CHANNEL": null,
+        "S3_INVENTORY_RULE_NAME": null,
+        "DEFAULT_ENCRYPTION_KMS": null,
         "S3_INVENTORY_FREQUENCY": "Daily"
+    },
+    "Help": {
+        "SLACK_WEBHOOK": "Optional, will output to CloudWatch logs if not present",
+        "S3_INVENTORY_BUCKET_PREFIX": "Required, prefix your S3 Inventory buckets use, ex: 'myorg-s3inventory' for myorg-s3inventory-us-east-1, myorg-s3inventory-us-east-2, etc",
+        "S3_INVENTORY_FORMAT": "Required, 'CSV' | 'ORC'",
+        "S3_INVENTORY_VERSIONING": "#Required, 'Current' | 'All'",
+        "S3_INVENTORY_ACCOUNT": "Optional accountID, assumes your inventory buckets are in the same account as the bucket if not set",
+        "SLACK_CHANNEL": "Optional, will output to CloudWatch logs if not present",
+        "S3_INVENTORY_RULE_NAME": "Required, rule name used when setting S3 inventory policies on your buckets",
+        "DEFAULT_ENCRYPTION_KMS": "Optional kmskeyid, defaults to SSE-AES256 if not set",
+        "S3_INVENTORY_FREQUENCY": "Required, 'Daily' | 'Weekly'"
     }
 }

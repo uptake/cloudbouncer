@@ -77,15 +77,18 @@ def validate_file(filename):
 if args['set-env-var'] is True:
     lambda_env_var = load_file(path+'lambda-env-variables.txt', 'Lambda Environment Variables')
 
-    print('Enter new values for environment variables, press enter to keep current')
+    print('Enter new values for environment variables, press enter to keep current, "None" for null')
     for var in lambda_env_var['Variables']:
         print(var)
         print('\tDescription: ' + lambda_env_var['Help'][var])
-        print('\tCurrent value: '+ lambda_env_var['Variables'][var])
+        print('\tCurrent value: '+ str(lambda_env_var['Variables'][var]))
         print('\tNew value: (enter to keep current)')
         new_value = raw_input()
         if new_value:
-            lambda_env_var['Variables'][var] = new_value
+            if new_value == 'None':
+                lambda_env_var['Variables'][var] = None
+            else:
+                lambda_env_var['Variables'][var] = new_value
 
     print('Lamba environment variables are now: ')
     print(json.dumps(lambda_env_var['Variables'], indent=4))
@@ -174,7 +177,7 @@ if args['deploy'] is True or args['update'] is True or args['delete'] is True:
         possible_variables = [x for x in load_variables['Variables']]
         if 'Variables' in load_variables:
             for key in possible_variables:
-                if load_variables['Variables'][key] == 'string':
+                if load_variables['Variables'][key] == None:
                     load_variables['Variables'].pop(key, None)
         lambda_environment_variables = {'Variables':load_variables['Variables']}
 
