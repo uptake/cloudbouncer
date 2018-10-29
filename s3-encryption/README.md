@@ -8,6 +8,7 @@ There are two components to ensuring S3 encryption at any time in your environme
 2. Ensure all current objects are audited, and if unencrypted, encrypt them
 
 Scripts in this repository can you help you bring both your current and future buckets and objects into compliance for any number of accounts.
+
 Scripts are invoked as command line tools using docopts argument parsing, ex `./s3-bucket-default-encryption.py --accounts=dev,qa,prd --kms=kmskeyid`
 `--help` for any script will give you a list of the arguments, syntax, assumptions, limitations, and examples
 
@@ -17,10 +18,12 @@ Dependencies are:
 - docopts `pip install docopts`
 
 ### Assumptions:
-You already have CloudTrail set up and configured to write to CloudWatch logs in all accounts/regions you want to monitor
-You already have the infrastructure required to configure S3 inventory set up, S3 Inventory buckets in each region you have an S3 bucket you want to audit with bucket policeis that allow S3 Inventory to write to them.  These can either be in one account and receive inventories from all monitored account, or exist in each account
-You are running this script with Admin-level credentials in each affected account, or have sufficient privileges to do all underlying operations (IAM role create/modify, cloudwatch rule create/modify, extensive S3, etc)
+- You already have CloudTrail set up and configured to write to CloudWatch logs in all accounts/regions you want to monitor
+- You already have the infrastructure required to configure S3 inventory, notably S3 Inventory buckets in each region you have an S3 bucket you want to audit with bucket policies that allows S3 Inventory to publish to them.  These can either be in one account and receive inventories from all monitored account, or exist in each account
+- You are running this script with Admin-level credentials in each affected account, or have sufficient privileges to do all underlying operations (IAM role create/modify, cloudwatch rule create/modify, extensive S3, etc)
+
 https://docs.aws.amazon.com/AmazonS3/latest/dev/storage-inventory.html is a great resource if you want to better understand what S3 Inventory is doing
+
 https://docs.aws.amazon.com/AmazonS3/latest/dev/bucket-encryption.html is the same for Default Encryption policies
 
 ## Future Objects - Stop the Bleeding
