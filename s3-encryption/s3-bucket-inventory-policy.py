@@ -111,7 +111,7 @@ def load_file(filename, purpose):
 
 # Load the specified variables for this set of accounts / regions into the lambda-env-variables.txt for use in bot deployment #
 if mode == 'apply':
-	lambda_env_var = load_file('lambda-env-variables.txt', 'Lambda Env Variables')
+	lambda_env_var = load_file('s3-bucket-configuration-bot/lambda-env-variables.txt', 'Lambda Env Variables')
 	lambda_env_var['Variables']['S3_INVENTORY_FREQUENCY'] = args['<frequency>']
 	lambda_env_var['Variables']['S3_INVENTORY_RULE_NAME'] = args['<inventory_rule_name>']
 	lambda_env_var['Variables']['S3_INVENTORY_BUCKET_PREFIX'] = args['<inventory_buckets_prefix>']
@@ -129,7 +129,7 @@ if mode == 'apply':
 	if args['--inventory_account'] is not None:
 		lambda_env_var['Variables']['S3_INVENTORY_ACCOUNT'] = args['--inventory_account']
 
-	lamba_env_var_file = open('lambda-env-variables.txt', 'w')
+	lamba_env_var_file = open('s3-bucket-configuration-bot/lambda-env-variables.txt', 'w')
 	lamba_env_var_file.write(json.dumps(lambda_env_var,indent=4,separators=(',', ': ')))
 	lamba_env_var_file.close()
 
