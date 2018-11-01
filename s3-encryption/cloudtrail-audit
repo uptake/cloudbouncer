@@ -1,0 +1,249 @@
+#!/usr/bin/env python
+# cloudtrail-audit: audit and enforce cloudtrail configuration in accounts
+#
+# Usage: cloudtrail-audit --name=<> --iam-role=<> --s3-bucket-prefix=<> [--loggroup=<> --multiregion ] [--remediate] [--accounts=<>] [--region=<>]
+# 
+# Arguments:
+#   --accounts=<>   # Optional, a comma-separated list of accounts to run in by your CLI profile names. Checks AWS_PROFILE env. variable if not set
+#   --region=<>     # Optional, the region you wish to base the trail in.  Checks AWS_REGION if not set, then defaults to us-east-1
+#   --remediate     # Implemented the specified cloudtrail configuration in accounts where it is not present
+#   --name=<>       # CloudTrail name, if not set uses Uptake default of 'Default'
+#   --iam-role=<>   # name for the iam-role that CloudTrail will use, if not set uses Uptake default of 'CloudTrail_CloudWatchLogs_Role'
+#   --loggroup=<>   # name for the CloudWatch Log Group to write logs to, if not set uses Uptake default of 'CloudTrail/DefaultLogGroup'
+#   --s3-bucket-prefix=<> # prefix for S3 bucket name, will be prefix-account
+#
+# Examples:
+#   $ ops cloudtrail-audit --accounts=dev,int
+#
+
+# Need to add the IAM role creation, S3 bucket creation, and ? prior to publishing
+
+import sys
+from os import path
+sys.path.append(path.normpath(path.join(path.dirname(__file__), "../../libexec")))
+
+from pyopts import pyopts
+args = pyopts(__file__)
+
+import boto3
+import json
+import datetime
+import time
+import timeit
+import os
+import multiprocessing
+
+ABORT = False
+if args['--accounts']:
+    accounts = args['--accounts'].split(',')
+else:
+    if 'AWS_PROFILE' in os.environ:
+        accounts = os.environ['AWS_PROFILE'].split(',')
+    else:
+        print('You did not specify --accounts and also do not have AWS_PROFILE exported to environmental variables')
+        ABORT = True
+if args['--region']:
+    region = args['--region']
+else:
+    if 'AWS_REGION' in os.environ:
+        region = os.environ['AWS_REGION']
+    else:
+        region = 'us-east-1'
+    
+cloudtrails = {} 
+filename = '/mnt/data/cloudtrail-audit-' + datetime.date.today().isoformat() + '.txt'
+
+if args['--name'] is not None:
+    target_trail = args['--name']
+else:
+    print('Please specify a name for this CloudTrail')
+
+if args['--iam-role'] is not None:
+    rolename =  args['--iam-role']
+else:
+    print('Please specify a name for the IAM role')
+
+if args['--loggroup'] is not None:
+    log_group_name = args['--loggroup']
+else:
+    log_group_name = 'CloudTrail/DefaultLogGroup'
+
+def json_serial(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+
+def check_for_S3Write(config):
+    for event in config['EventSelectors']:
+        for dataresource in event['DataResources']:
+            # Format of all S3 buckets, not subset of buckets, with all objects.  Can possibly add the write/all condition?  Since I don't care about reads
+            if 'Values' in dataresource and 'arn:aws:s3' in dataresource['Values'] and dataresource['Type'] == 'AWS::S3::Object':
+                return True
+    return False
+
+def check_for_Cloudwatch():
+    if 'CloudWatchLogsLogGroupArn' in trail and trail['CloudWatchLogsLogGroupArn'] == CloudTrailLogGroupArn:
+        return True
+    elif 'CloudWatchLogsLogGroupArn' in trail:
+        print(account + ' ' + region + ' ' + trail['Name'] + ' WARNING: CloudTrail is writing to CloudWatch Logs, but not to the target log group, instead to : ' + trail['CloudWatchLogsLogGroupArn'])
+        return True
+    else:
+        return False
+
+def create_log_group():
+    # Make sure default trail is publishing to CloudWatch logs
+    # Create the log group if not created already?
+    group_exists = False
+    logs = session.client('logs')
+    try:
+        log_groups = logs.describe_log_groups()
+    except Exception as e:
+        print(e)
+    else:
+        for group in log_groups['logGroups']:
+            if group['logGroupName'] == log_group_name:
+                group_exists = True
+        if group_exists is False:
+            try:
+                new_log_group = logs.create_log_group(logGroupName=log_group_name)
+            except Exception as e:
+                print(e)
+            else:
+                print(account + ' ' + region + ' created new log group ' + log_group_name)
+
+def put_event_selectors():
+    try:
+        new_event_selector = ct.put_event_selectors(
+            TrailName=target_trail,
+            EventSelectors=[
+            {
+                'DataResources':[{
+                        "Values": ["arn:aws:s3"],
+                        'Type': 'AWS::S3::Object'
+                }],
+                'ReadWriteType':'WriteOnly'
+            },
+            {
+                "IncludeManagementEvents":True,
+                "DataResources": [],
+                "ReadWriteType": "All"
+            }]
+        )
+    except Exception as e:
+        print(account + ' ' + region + ' ' + target_trail + ' ERROR adding S3 Write events rule')
+        print(e)
+    else:
+        if check_for_S3Write(new_event_selector) is True:
+            print(account + ' ' + region + ' ' + target_trail + ' added S3 Write events rule')
+        else:
+            print(account + ' ' + region + ' ' + target_trail + ' ERROR adding S3 Write events rule')
+
+def update_trail():
+    try:
+        update_trail = ct.update_trail(
+            Name=target_trail,
+            CloudWatchLogsLogGroupArn=CloudTrailLogGroupArn,
+            CloudWatchLogsRoleArn=CloudTrailIAMroleArn
+        )
+    except Exception as e:
+        print(e)
+    else:
+        print(account + ' ' + region + ' ' + target_trail + '  to write to ' + log_group_name)
+
+def create_bucket(bucket_name):
+    # may need to check if bucket already exists
+    s3 = session.client('s3')
+    try:
+        location = s3.create_bucket(
+            Bucket=bucket_name,
+            ACL='private'
+        )
+    except Exception as e:
+        if e.response['Error']['Code'] == 'BucketAlreadyExists':
+            print('Bucket ' + bucket_name + ' already exists in account ' + account)
+        else:
+            print(e)
+    else:
+        print('Created bucket ' + location['Location'] + ' in account ' + account)
+        s3.get_waiter('bucket_exists').wait(Bucket=bucket_name)
+
+def create_CloudTrail():
+    if args['--s3-bucket-prefix'] is not None:
+        bucket_name = args['--s3-bucket-prefix']+'-'+account
+    else:
+        print('ERROR: No S3 bucket name detected, and no CloudTrail detected that matches the target, ')
+        return
+    create_bucket(bucket_name)
+    create_log_group()
+    try:
+        response = client.create_trail(
+            Name=target_trail,
+            S3BucketName=bucket_name,
+            IncludeGlobalServiceEvents=True,
+            IsMultiRegionTrail=True,
+            EnableLogFileValidation=True,
+            CloudWatchLogsLogGroupArn=CloudTrailLogGroupArn,
+            CloudWatchLogsRoleArn=CloudTrailIAMroleArn,
+        )
+    except Exception as e:
+        print(e)
+    else:
+        print(account + ' ' + region + ' ' + target_trail + ': enabled new CloudTrail')
+        put_event_selectors()
+
+if ABORT is False:
+    for account in accounts:
+        cloudtrails[account] = {}
+
+        regions = boto3.session.Session(profile_name=account,region_name=region).client('ec2').describe_regions()
+        for region in regions['Regions']:
+            region = region['RegionName']
+            cloudtrails[account][region] = {}
+            session = boto3.session.Session(profile_name=account, region_name=region) #set profile per account
+            ct = session.client('cloudtrail')
+
+            account_num = session.client('sts').get_caller_identity()['Account']
+            CloudTrailIAMroleArn = 'arn:aws:iam::' + account_num + ':role/' + rolename
+            CloudTrailLogGroupArn = 'arn:aws:logs:' + region + ':' + account_num + ':log-group:' + log_group_name + ':*'
+
+            try:
+                trails = ct.describe_trails()
+            except Exception as e:
+                print(e)
+            else:
+                cloudtrails[account][region] = trails['trailList']
+                TARGET_FOUND = False
+                trailcount = 0
+                for trail in trails['trailList']:
+                    # Determine whether this is a multi-region trail, and if so, whether the HomeRegion matches current
+                    if trail['IsMultiRegionTrail'] == True and trail['HomeRegion'] != region:
+                        pass
+                    else:  # Get details about any region-specific trail, or multi-region trail in its home region
+                        try:
+                            config = ct.get_event_selectors(TrailName=trail['TrailARN'])
+                        except Exception as e:
+                            print(e)
+                        else:
+                            cloudtrails[account][region][trailcount]['EventSelectors'] = config['EventSelectors']
+                            S3_Write_Flag = check_for_S3Write(config)
+                            CloudWatch_Logging = check_for_Cloudwatch()
+
+                            if trail['Name'] == target_trail:
+                                TARGET_FOUND = True
+                                if args['--remediate'] is False:
+                                    print(account + ' ' + region + ' ' + trail['Name'] + ' exists and is capturing S3 object level activity: ' + str(S3_Write_Flag))
+                                    print(account + ' ' + region + ' ' + trail['Name'] + ' exists and is writing to CloudWatch: ' + str(CloudWatch_Logging))
+                                else:
+                                    if S3_Write_Flag is False:
+                                        put_event_selectors()
+                                    if CloudWatch_Logging is False:
+                                        create_log_group()
+                                    update_trail()
+                            else:
+                                print(account + ' ' + region + ' ' + 'warning: a non-target trail exists ' + json.dumps(trail) + ', is capturing S3 object level activity: ' + str(S3_Write_Flag) + ' and is writing to CloudWatch: ' + str(CloudWatch_Logging))
+                    trailcount += 1
+                if TARGET_FOUND is False and args['--remediate'] is True:              
+                    print(account + ' ' + region + ' does not have the target cloudtrail, creating it')
+                    create_CloudTrail()
+    output_file = open(filename, 'w')
+    output_file.write(json.dumps(cloudtrails,indent=4, separators=(',', ': ')))
